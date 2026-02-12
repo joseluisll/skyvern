@@ -348,6 +348,8 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
     else:
         # Last resort: parse browser_address hostname
         browser_address = browser_session.browser_address
+        if not browser_address:
+            raise Exception(f"{class_name} No browser address available for VNC connection")
         parsed_browser_address = urlparse(browser_address)
         host = parsed_browser_address.hostname
         vnc_url = f"ws://{host}:{vnc_channel.vnc_port}"
