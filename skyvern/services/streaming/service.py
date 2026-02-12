@@ -7,8 +7,7 @@ import structlog
 
 from skyvern.forge import app
 from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
-from skyvern.forge.sdk.workflow.models.workflow import WorkflowRunStatus
-from skyvern.utils.files import get_json_from_file, get_skyvern_state_file_path
+from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 
 INTERVAL = 1
 LOG = structlog.get_logger(__name__)
@@ -17,8 +16,8 @@ LOG = structlog.get_logger(__name__)
 class StreamingService:
     """
     Service for capturing and streaming screenshots from active workflows/tasks.
-    This service monitors the Skyvern state file and captures screenshots when
-    a task or workflow run is active, uploading them to storage.
+    This service monitors running workflow runs via database queries and captures
+    screenshots when a workflow run is active, uploading them to storage.
     """
 
     def __init__(self) -> None:
@@ -69,51 +68,47 @@ class StreamingService:
                 if self._stop_event.is_set():
                     break
 
-                # Try to read current state
+                # Get all organizations and check for running workflows in each
                 try:
-                    current_json = get_json_from_file(get_skyvern_state_file_path())
+                    organizations = await app.DATABASE.get_all_organizations()
+                    workflow_runs: list[WorkflowRun] = []
+
+                    # Query running workflows for each organization
+                    for org in organizations:
+                        org_workflow_runs = await app.DATABASE.get_workflow_runs(
+                            organization_id=org.organization_id,
+                            status=[WorkflowRunStatus.running],
+                        )
+                        workflow_runs.extend(org_workflow_runs)
                 except Exception as e:
-                    LOG.debug("Failed to read state file", error=str(e))
+                    LOG.debug("Failed to get running workflow runs", error=str(e))
                     continue
 
-                task_id = current_json.get("task_id")
-                workflow_run_id = current_json.get("workflow_run_id")
-                organization_id = current_json.get("organization_id")
-
-                # Skip if no valid organization or identifiers
-                if not organization_id or (not task_id and not workflow_run_id):
+                # Skip if no running workflows found
+                if not workflow_runs:
                     continue
 
                 # Get task/workflow info to check status
                 try:
-                    file_name = None
+                    file_name: str | None = None
+                    organization_id: str | None = None
+                    workflow_run_id: str | None = None
 
-                    if workflow_run_id:
-                        workflow_run = await app.DATABASE.get_workflow_run(workflow_run_id=workflow_run_id)
+                    # Use the first running workflow run (or iterate through all)
+                    for workflow_run in workflow_runs:
+                        if workflow_run and workflow_run.status == WorkflowRunStatus.running:
+                            organization_id = workflow_run.organization_id
+                            workflow_run_id = workflow_run.workflow_run_id
+                            file_name = f"{workflow_run_id}.png"
+                            break
 
-                        # Skip if workflow is in final state or not found
-                        if not workflow_run or workflow_run.status in [
-                            WorkflowRunStatus.completed,
-                            WorkflowRunStatus.failed,
-                            WorkflowRunStatus.terminated,
-                        ]:
-                            continue
-                        file_name = f"{workflow_run_id}.png"
-
-                    elif task_id:
-                        task = await app.DATABASE.get_task(task_id=task_id, organization_id=organization_id)
-
-                        # Skip if task is in final state or not found
-                        if not task or task.status.is_final():
-                            continue
-                        file_name = f"{task_id}.png"
-                    else:
+                    # Skip if no valid workflow run found
+                    if not organization_id or not workflow_run_id or not file_name:
                         continue
 
                 except Exception as e:
                     LOG.exception(
-                        "Failed to get task or workflow run while taking streaming screenshot in worker",
-                        task_id=task_id,
+                        "Failed to get workflow run while taking streaming screenshot in worker",
                         workflow_run_id=workflow_run_id,
                         organization_id=organization_id,
                         error=str(e),
