@@ -12,17 +12,134 @@ from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunS
 INTERVAL = 1
 LOG = structlog.get_logger(__name__)
 
+# VNC Streaming Configuration
+DISPLAY_NUM = ":99"
+SCREEN_GEOMETRY = "1920x1080x24"
+VNC_PORT = "5900"
+WS_PORT = "6080"
+
 
 class StreamingService:
     """
     Service for capturing and streaming screenshots from active workflows/tasks.
     This service monitors running workflow runs via database queries and captures
     screenshots when a workflow run is active, uploading them to storage.
+
+    It also manages the VNC streaming infrastructure (Xvfb, x11vnc, websockify).
     """
 
     def __init__(self) -> None:
         self._monitoring_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+        self._vnc_processes: dict[str, subprocess.Popen] = {}
+
+    def _ensure_vnc_services_running(self) -> None:
+        """
+        Ensure VNC streaming services are running (Xvfb, x11vnc, websockify).
+        These services are required for screenshot capture and streaming.
+        """
+        LOG.info("Ensuring VNC streaming services are running...")
+
+        def is_running_exact(process_name: str) -> bool:
+            try:
+                proc = subprocess.Popen(
+                    ["pgrep", "-x", process_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                _, _ = proc.communicate()
+                return proc.returncode == 0
+            except Exception:
+                return False
+
+        def is_running_match(pattern: str) -> bool:
+            try:
+                proc = subprocess.Popen(
+                    ["pgrep", "-f", pattern],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                stdout, _ = proc.communicate()
+                return proc.returncode == 0 and bool(stdout.strip())
+            except Exception:
+                return False
+
+        def start_xvfb() -> None:
+            LOG.info("Starting Xvfb...")
+            cmd = ["Xvfb", DISPLAY_NUM, "-screen", "0", SCREEN_GEOMETRY]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._vnc_processes["xvfb"] = proc
+            LOG.info("Xvfb started successfully")
+
+        def start_x11vnc() -> None:
+            LOG.info("Starting x11vnc...")
+            cmd = [
+                "x11vnc",
+                "-display",
+                DISPLAY_NUM,
+                "-bg",
+                "-nopw",
+                "-listen",
+                "localhost",
+                "-xkb",
+                "-forever",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._vnc_processes["x11vnc"] = proc
+            LOG.info("x11vnc started successfully")
+
+        def start_websockify() -> None:
+            LOG.info("Starting websockify...")
+            cmd = [
+                "websockify",
+                WS_PORT,
+                f"localhost:{VNC_PORT}",
+                "--daemon",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._vnc_processes["websockify"] = proc
+            LOG.info("websockify started successfully")
+
+        # Check if VNC binaries are available
+        vnc_available = True
+        for binary in ["Xvfb", "x11vnc", "websockify"]:
+            try:
+                subprocess.run([binary, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                LOG.error(f"VNC binary not available: {binary}")
+                vnc_available = False
+
+        if not vnc_available:
+            LOG.error("One or more VNC services are not installed. Screenshot streaming will be disabled.")
+            return
+
+        # Start Xvfb if not running
+        if not is_running_exact("Xvfb"):
+            start_xvfb()
+            LOG.info("Xvfb process restarted")
+        else:
+            LOG.debug("Xvfb already running")
+
+        # Start x11vnc if not running
+        if not is_running_exact("x11vnc"):
+            start_x11vnc()
+            LOG.info("x11vnc process restarted")
+        else:
+            LOG.debug("x11vnc already running")
+
+        # Start websockify if not running
+        if not is_running_match(f"websockify.*{WS_PORT}"):
+            start_websockify()
+            LOG.info("websockify process restarted")
+        else:
+            LOG.debug("websockify already running")
+
+        LOG.info(
+            "VNC streaming services configured",
+            display=DISPLAY_NUM,
+            vnc_port=VNC_PORT,
+            ws_port=WS_PORT,
+        )
 
     def start_monitoring(self) -> asyncio.Task:
         """
@@ -34,6 +151,9 @@ class StreamingService:
         if self._monitoring_task and not self._monitoring_task.done():
             LOG.warning("Streaming service monitoring is already running")
             return self._monitoring_task
+
+        # Ensure VNC services are running before starting monitoring
+        self._ensure_vnc_services_running()
 
         self._stop_event.clear()
         self._monitoring_task = asyncio.create_task(self._monitor_loop())
@@ -71,6 +191,8 @@ class StreamingService:
                 # Get all organizations and check for running workflows in each
                 try:
                     organizations = await app.DATABASE.get_all_organizations()
+                    LOG.info("Discovered organizations", count=len(organizations))
+
                     workflow_runs: list[WorkflowRun] = []
 
                     # Query running workflows for each organization
@@ -80,12 +202,15 @@ class StreamingService:
                             status=[WorkflowRunStatus.running],
                         )
                         workflow_runs.extend(org_workflow_runs)
+
+                    LOG.info("Found running workflows", count=len(workflow_runs))
                 except Exception as e:
                     LOG.debug("Failed to get running workflow runs", error=str(e))
                     continue
 
                 # Skip if no running workflows found
                 if not workflow_runs:
+                    LOG.debug("No active workflow runs found - nothing to do")
                     continue
 
                 # Get task/workflow info to check status
@@ -100,10 +225,12 @@ class StreamingService:
                             organization_id = workflow_run.organization_id
                             workflow_run_id = workflow_run.workflow_run_id
                             file_name = f"{workflow_run_id}.png"
+                            LOG.debug("Selected workflow run for screenshot capture", workflow_run_id=workflow_run_id)
                             break
 
                     # Skip if no valid workflow run found
                     if not organization_id or not workflow_run_id or not file_name:
+                        LOG.debug("No valid workflow run found - nothing to do")
                         continue
 
                 except Exception as e:
@@ -120,19 +247,24 @@ class StreamingService:
                 os.makedirs(org_dir, exist_ok=True)
                 png_file_path = f"{org_dir}/{file_name}"
 
-                # Capture screenshot
-                await self._capture_screenshot(png_file_path)
-
-                # Upload to storage
-                try:
-                    await app.STORAGE.save_streaming_file(organization_id, file_name)
-                except Exception as e:
-                    LOG.debug(
-                        "Failed to upload screenshot",
-                        organization_id=organization_id,
-                        file_name=file_name,
-                        error=str(e),
-                    )
+                # Capture and upload screenshot
+                if await self._capture_screenshot(png_file_path):
+                    LOG.debug("Screenshot captured successfully", workflow_run_id=workflow_run_id)
+                    try:
+                        await app.STORAGE.save_streaming_file(organization_id, file_name)
+                        LOG.debug(
+                            "Screenshot uploaded to storage", workflow_run_id=workflow_run_id, file_name=file_name
+                        )
+                    except Exception as e:
+                        LOG.debug(
+                            "Failed to upload screenshot",
+                            organization_id=organization_id,
+                            workflow_run_id=workflow_run_id,
+                            file_name=file_name,
+                            error=str(e),
+                        )
+                else:
+                    LOG.debug("Screenshot capture failed", workflow_run_id=workflow_run_id)
 
             except Exception as e:
                 LOG.error("Unexpected error in streaming monitoring loop", error=str(e), exc_info=True)

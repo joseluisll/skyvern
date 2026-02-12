@@ -46,19 +46,8 @@ _kill_xvfb_on_term() {
 # Setup a trap to catch SIGTERM and relay it to child processes
 trap _kill_xvfb_on_term TERM
 
-echo "Starting Xvfb..."
-# delete the lock file if any
-rm -f /tmp/.X99-lock
-# Set display environment variable
-export DISPLAY=:99
-# Start Xvfb
-Xvfb :99 -screen 0 1920x1080x16 &
-xvfb=$!
+# The VNC streaming services (Xvfb, x11vnc, websockify) are now managed by
+# StreamingService.start_monitoring() which is automatically called when the API app starts
 
-# The streaming service is now integrated into the ForgeApp
-# and will be started automatically when the API app starts
-
-echo "Starting live streaming services..."
-./scripts/start_vnc_streaming.sh
 # Run the command and pass in all three arguments
 python -m skyvern.forge
