@@ -476,22 +476,26 @@ async def loop_stream_vnc(vnc_channel: VncChannel) -> None:
                 try:
                     if vnc_channel.websocket.client_state != WebSocketState.CONNECTED:
                         continue
+                    # Ensure data is bytes before sending
+                    if isinstance(data, str):
+                        data = data.encode("utf-8")
                     await vnc_channel.websocket.send_bytes(data)
-                except WebSocketDisconnect:
+                except RuntimeError as e:
+                    # Handle the case where send is called after close
+                    if "Cannot call" in str(e) and "close message has been sent" in str(e):
+                        LOG.debug(f"{class_name} Websocket already closed, skipping send.", **vnc_channel.identity)
+                        continue
+                    raise
+                except (WebSocketDisconnect, ConnectionClosedError, ConnectionClosedOK) as e:
                     LOG.info(
-                        f"{class_name} Frontend disconnected from the vnc channel session.", **vnc_channel.identity
+                        f"{class_name} Frontend closed the vnc channel session.", exception=e, **vnc_channel.identity
                     )
-                    await vnc_channel.close(reason="frontend-disconnected")
-                except ConnectionClosedError:
-                    LOG.info(f"{class_name} Frontend closed the vnc channel session.", **vnc_channel.identity)
-                    await vnc_channel.close(reason="frontend-closed")
-                except ConnectionClosedOK:
-                    LOG.info(f"{class_name} Frontend closed the vnc channel session cleanly.", **vnc_channel.identity)
-                    await vnc_channel.close(reason="frontend-closed-ok")
                 except asyncio.CancelledError:
                     pass
-                except Exception:
-                    LOG.exception(f"{class_name} An unexpected exception occurred.", **vnc_channel.identity)
+                except Exception as e:
+                    LOG.exception(
+                        f"{class_name} An unexpected exception occurred.", exception=e, **vnc_channel.identity
+                    )
                     raise
 
         loops = [
