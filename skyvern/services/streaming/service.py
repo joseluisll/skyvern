@@ -40,6 +40,9 @@ class StreamingService:
         """
         LOG.info("Ensuring VNC streaming services are running...")
 
+        # Set DISPLAY environment variable
+        os.environ["DISPLAY"] = DISPLAY_NUM
+
         def is_running_exact(process_name: str) -> bool:
             try:
                 proc = subprocess.Popen(
@@ -66,6 +69,15 @@ class StreamingService:
 
         def start_xvfb() -> None:
             LOG.info("Starting Xvfb...")
+            # Clean up any existing lock file
+            lock_file = f"/tmp/.X{DISPLAY_NUM[1:]}-lock"
+            if os.path.exists(lock_file):
+                try:
+                    os.remove(lock_file)
+                    LOG.debug("Removed existing X server lock file", lock_file=lock_file)
+                except Exception as e:
+                    LOG.warning("Failed to remove X server lock file", error=str(e))
+
             cmd = ["Xvfb", DISPLAY_NUM, "-screen", "0", SCREEN_GEOMETRY]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._vnc_processes["xvfb"] = proc
@@ -165,6 +177,15 @@ class StreamingService:
         """
         if not self._monitoring_task or self._monitoring_task.done():
             return
+
+        # Clean up VNC processes
+        for name, proc in list(self._vnc_processes.items()):
+            try:
+                proc.terminate()
+                LOG.info(f"Terminated {name} process")
+            except Exception as e:
+                LOG.warning(f"Failed to terminate {name} process", error=str(e))
+        self._vnc_processes.clear()
 
         self._stop_event.set()
         try:
