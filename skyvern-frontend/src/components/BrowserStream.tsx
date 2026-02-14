@@ -31,7 +31,7 @@ import {
   type MessageInExfiltratedEvent,
 } from "@/store/useRecordingStore";
 import { useSettingsStore } from "@/store/SettingsStore";
-import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey } from "@/util/env";
+import { wssBaseUrl, newWssBaseUrl, getRuntimeApiKey, environment } from "@/util/env";
 import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 
@@ -94,6 +94,10 @@ interface MessageOutAskForClipboardResponse {
 }
 
 type MessageOut = MessageOutAskForClipboardResponse;
+
+interface LocalDirectVncResponse {
+  url: string;
+}
 
 type Props = {
   browserSessionId?: string;
@@ -211,6 +215,42 @@ function BrowserStream({
   const recordingStore = useRecordingStore();
   const settingsStore = useSettingsStore();
   const credentialGetter = useCredentialGetter();
+  const [directVncUrl, setDirectVncUrl] = useState<string | null>(null);
+  const [directVncLoading, setDirectVncLoading] = useState(false);
+  const [directVncError, setDirectVncError] = useState<string | null>(null);
+  const [directVncRetry, setDirectVncRetry] = useState(0);
+
+  const fetchLocalDirectVncUrl = useCallback(async () => {
+    if (!runId) {
+      return;
+    }
+
+    setDirectVncLoading(true);
+    setDirectVncError(null);
+    setDirectVncUrl(null);
+
+    try {
+      const client = await getClient(credentialGetter, "v1");
+      const response = await client.get<LocalDirectVncResponse>(
+        `/stream/local/vnc/workflow_run/${runId}`,
+        {
+          params: clientId ? { client_id: clientId } : undefined,
+        },
+      );
+
+      if (!response.data?.url) {
+        throw new Error("No direct VNC URL returned");
+      }
+
+      setDirectVncUrl(response.data.url);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Failed to fetch direct VNC URL";
+      setDirectVncError(message);
+    } finally {
+      setDirectVncLoading(false);
+    }
+  }, [clientId, credentialGetter, runId]);
 
   const getWebSocketParams = useCallback(async () => {
     const clientIdQueryParam = `client_id=${clientId}`;
@@ -223,10 +263,58 @@ function BrowserStream({
       credentialQueryParam = token ? `token=Bearer ${token}` : "";
     }
 
-    return credentialQueryParam
-      ? `${credentialQueryParam}&${clientIdQueryParam}`
-      : clientIdQueryParam;
+      return credentialQueryParam
+        ? `${credentialQueryParam}&${clientIdQueryParam}`
+        : clientIdQueryParam;
   }, [clientId, credentialGetter]);
+
+  useEffect(() => {
+    if (
+      environment !== "local" ||
+      entity !== "workflow" ||
+      !runId ||
+      !showStream
+    ) {
+      setDirectVncUrl(null);
+      setDirectVncError(null);
+      setDirectVncLoading(false);
+      return;
+    }
+
+    fetchLocalDirectVncUrl();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [environment, entity, runId, showStream, fetchLocalDirectVncUrl, directVncRetry]);
+
+  useEffect(() => {
+    if (!directVncError) {
+      return;
+    }
+
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      setDirectVncRetry((x) => x + 1);
+    }, 5000);
+
+    return () => window.clearTimeout(timer);
+  }, [directVncError]);
+
+  useEffect(() => {
+    if (
+      environment !== "local" ||
+      entity !== "workflow" ||
+      !runId ||
+      !showStream
+    ) {
+      setDirectVncUrl(null);
+      return;
+    }
+
+    fetchLocalDirectVncUrl();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [environment, entity, runId, showStream, fetchLocalDirectVncUrl, directVncRetry]);
 
   // browser is ready
   useEffect(() => {
@@ -263,6 +351,8 @@ function BrowserStream({
   // vnc socket
   useEffect(
     () => {
+      const isDirectLocalWorkflow = environment === "local" && entity === "workflow";
+
       if (!showStream || !canvasContainer || !runId) {
         if (rfbRef.current) {
           rfbRef.current.disconnect();
@@ -272,19 +362,27 @@ function BrowserStream({
         return;
       }
 
-      async function setupVnc() {
-        if (rfbRef.current && isVncConnected) {
-          return;
-        }
+      if (
+        isDirectLocalWorkflow &&
+        (directVncLoading || directVncError || !directVncUrl)
+      ) {
+        setIsVncConnected(false);
+        return;
+      }
 
-        const wsParams = await getWebSocketParams();
-        const vncUrl =
-          entity === "browserSession"
-            ? `${newWssBaseUrl}/stream/vnc/browser_session/${runId}?${wsParams}`
+        async function setupVnc() {
+          if (rfbRef.current && isVncConnected) {
+            return;
+          }
+
+        const vncUrl = isDirectLocalWorkflow
+          ? directVncUrl!
+          : entity === "browserSession"
+            ? `${newWssBaseUrl}/stream/vnc/browser_session/${runId}?${await getWebSocketParams()}`
             : entity === "task"
-              ? `${wssBaseUrl}/stream/vnc/task/${runId}?${wsParams}`
+              ? `${wssBaseUrl}/stream/vnc/task/${runId}?${await getWebSocketParams()}`
               : entity === "workflow"
-                ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${wsParams}`
+                ? `${wssBaseUrl}/stream/vnc/workflow_run/${runId}?${await getWebSocketParams()}`
                 : null;
 
         if (!vncUrl) {
@@ -368,16 +466,25 @@ function BrowserStream({
       hasBrowserSession,
       runId,
       showStream,
-      vncDisconnectedTrigger, // will re-run on disconnects
+      vncDisconnectedTrigger,
+      directVncUrl,
+      directVncLoading,
+      directVncError,
     ],
   );
 
-  useEffect(() => {
-    if (!showStream || !canvasContainer || !runId) {
-      return;
-    }
+    useEffect(() => {
+      if (!showStream || !canvasContainer || !runId) {
+        return;
+      }
 
-    let ws: WebSocket | null = null;
+      if (environment === "local" && entity === "workflow") {
+        setIsMessageConnected(false);
+        setMessageSocket(null);
+        return;
+      }
+
+      let ws: WebSocket | null = null;
 
     const connect = async () => {
       const wsParams = await getWebSocketParams();
