@@ -35,7 +35,6 @@ from skyvern.exceptions import (
     BlockNotFound,
     BrowserProfileNotFound,
     BrowserSessionNotFound,
-    CannotUpdateWorkflowDueToCodeCache,
     FailedToSendWebhook,
     InvalidCredentialId,
     MissingValueForParameter,
@@ -71,6 +70,7 @@ from skyvern.forge.sdk.workflow.models.block import (
     ExtractionBlock,
     NavigationBlock,
     TaskV2Block,
+    compute_conditional_scopes,
     get_all_blocks,
 )
 from skyvern.forge.sdk.workflow.models.parameter import (
@@ -1207,6 +1207,9 @@ class WorkflowService:
             )
             return workflow_run, blocks_to_update
 
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
+        conditional_wrb_ids: dict[str, str] = {}
+
         visited_labels: set[str] = set()
         current_label = start_label
         block_idx = 0
@@ -1225,6 +1228,15 @@ class WorkflowService:
                     failure_reason=f"Unable to find block with label {current_label}",
                 )
                 break
+
+            # Determine the parent for timeline nesting: if this block is
+            # inside a conditional's scope, parent it to that conditional's
+            # workflow_run_block rather than the root.
+            parent_wrb_id: str | None = None
+            if current_label in conditional_scopes:
+                cond_label = conditional_scopes[current_label]
+                if cond_label in conditional_wrb_ids:
+                    parent_wrb_id = conditional_wrb_ids[cond_label]
 
             (
                 workflow_run,
@@ -1245,7 +1257,13 @@ class WorkflowService:
                 loaded_script_module=loaded_script_module,
                 is_script_run=is_script_run,
                 blocks_to_update=blocks_to_update,
+                parent_workflow_run_block_id=parent_wrb_id,
             )
+
+            # Track conditional workflow_run_block_ids so branch targets
+            # can be parented to them.
+            if block.block_type == BlockType.CONDITIONAL and block_result and block_result.workflow_run_block_id:
+                conditional_wrb_ids[block.label] = block_result.workflow_run_block_id
 
             visited_labels.add(current_label)
             if should_stop:
@@ -1299,6 +1317,7 @@ class WorkflowService:
         loaded_script_module: Any,
         is_script_run: bool,
         blocks_to_update: set[str],
+        parent_workflow_run_block_id: str | None = None,
     ) -> tuple[WorkflowRun, set[str], BlockResult | None, bool, dict[str, Any] | None]:
         organization_id = organization.organization_id
         workflow_run_block_result: BlockResult | None = None
@@ -1427,6 +1446,7 @@ class WorkflowService:
                 )
                 workflow_run_block_result = await block.execute_safe(
                     workflow_run_id=workflow_run_id,
+                    parent_workflow_run_block_id=parent_workflow_run_block_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                 )
@@ -2140,7 +2160,6 @@ class WorkflowService:
         workflow_definition: WorkflowDefinition,
         organization_id: str,
         delete_script: bool = True,
-        delete_code_cache_is_ok: bool = False,
     ) -> None:
         if workflow_definition:
             workflow_definition.validate()
@@ -2216,27 +2235,6 @@ class WorkflowService:
                     )
                     return
 
-                if published_groups and not delete_code_cache_is_ok:
-                    LOG.info(
-                        "Workflow definition changed, asking user if clearing published cached blocks is ok",
-                        workflow_id=workflow.workflow_id,
-                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-                        organization_id=organization_id,
-                        previous_version=previous_valid_workflow.version,
-                        new_version=workflow.version,
-                        invalidate_reason=plan.reason,
-                        invalidate_label=plan.label,
-                        invalidate_index_prev=plan.previous_index,
-                        invalidate_index_new=plan.new_index,
-                        block_labels_to_disable=plan.block_labels_to_disable,
-                        to_clear_published_cnt=len(published_groups),
-                        to_clear_non_published_cnt=len(cached_groups),
-                    )
-
-                    raise CannotUpdateWorkflowDueToCodeCache(
-                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-                    )
-
                 try:
                     groups_to_clear = [*cached_groups, *published_groups]
                     await self._clear_cached_block_groups(
@@ -2278,38 +2276,7 @@ class WorkflowService:
                 )
                 return
 
-            to_delete_published = [script for script in candidates if script.status == ScriptStatus.published]
-            to_delete = [script for script in candidates if script.status != ScriptStatus.published]
-
-            if len(to_delete_published) > 0:
-                if not delete_code_cache_is_ok:
-                    LOG.info(
-                        "Workflow definition changed, asking user if deleting published code is ok",
-                        workflow_id=workflow.workflow_id,
-                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-                        organization_id=organization_id,
-                        previous_version=previous_valid_workflow.version,
-                        new_version=workflow.version,
-                        to_delete_non_published_cnt=len(to_delete),
-                        to_delete_published_cnt=len(to_delete_published),
-                    )
-
-                    raise CannotUpdateWorkflowDueToCodeCache(
-                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-                    )
-                else:
-                    LOG.info(
-                        "Workflow definition changed, user answered yes to deleting published code",
-                        workflow_id=workflow.workflow_id,
-                        workflow_permanent_id=previous_valid_workflow.workflow_permanent_id,
-                        organization_id=organization_id,
-                        previous_version=previous_valid_workflow.version,
-                        new_version=workflow.version,
-                        to_delete_non_published_cnt=len(to_delete),
-                        to_delete_published_cnt=len(to_delete_published),
-                    )
-
-                    to_delete.extend(to_delete_published)
+            to_delete = candidates
 
             if len(to_delete) > 0:
                 try:
@@ -3132,11 +3099,6 @@ class WorkflowService:
             organization_id=workflow_run.organization_id,
             include_step_count=True,
         )
-        LOG.info(
-            "Built workflow run status response",
-            workflow_run_status_response=workflow_run_status_response,
-        )
-
         if not workflow_run.webhook_callback_url:
             LOG.warning(
                 "Workflow has no webhook callback url. Not sending workflow response",
@@ -3339,7 +3301,6 @@ class WorkflowService:
         request: WorkflowCreateYAMLRequest,
         workflow_permanent_id: str | None = None,
         delete_script: bool = True,
-        delete_code_cache_is_ok: bool = True,
     ) -> Workflow:
         organization_id = organization.organization_id
 
@@ -3449,7 +3410,6 @@ class WorkflowService:
                 workflow_definition=workflow_definition,
                 organization_id=organization_id,
                 delete_script=delete_script,
-                delete_code_cache_is_ok=delete_code_cache_is_ok,
             )
 
             return updated_workflow
