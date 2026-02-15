@@ -34,6 +34,7 @@ class StreamingService:
     _base_xvfb_process: subprocess.Popen | None = None
     _screenshot_task: asyncio.Task | None = None
     _running: bool = False
+    _database: AgentDB | None = None
 
     def __new__(cls, database: AgentDB | None = None) -> StreamingService:
         if cls._instance is None:

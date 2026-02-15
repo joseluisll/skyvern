@@ -37,6 +37,7 @@ from skyvern.forge.sdk.workflow.context_manager import WorkflowContextManager
 from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.services.streaming import StreamingService
+from skyvern.utils import detect_os
 from skyvern.webeye.browser_manager import BrowserManager
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
@@ -261,22 +262,6 @@ def create_forge_app() -> ForgeApp:
     app.setup_api_app = None
     app.api_app_startup_event = None
     app.api_app_shutdown_event = None
-
-    # Set up startup/shutdown events to manage streaming service monitoring
-    if app.STREAMING_SERVICE:
-        # Capture the streaming service in a local variable for the closures
-        streaming_service = app.STREAMING_SERVICE
-
-        async def _startup_event(fastapi_app: FastAPI) -> None:
-            structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
-            streaming_service.start_monitoring()
-
-        async def _shutdown_event() -> None:
-            structlog.get_logger(__name__).info("Stopping streaming service monitoring loop")
-            await streaming_service.stop_monitoring()
-
-        app.api_app_startup_event = _startup_event
-        app.api_app_shutdown_event = _shutdown_event
 
     app.agent = ForgeAgent()
 

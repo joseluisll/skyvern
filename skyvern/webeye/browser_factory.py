@@ -498,10 +498,11 @@ async def _create_headless_chromium(
     )
 
     # Set DISPLAY environment variable for the browser process (for VNC support)
-    _apply_display_env(browser_args, kwargs.get("display_number"))
+    display_number_raw = cast(int | None, kwargs.get("display_number"))
+    _apply_display_env(browser_args, display_number_raw)
 
     # Clean up stale Chrome lock files if using a persistent user_data_dir
-    if browser_session_dir or browser_profile_id:
+    if user_data_dir or browser_profile_id:
         cleanup_stale_chrome_lock_files(user_data_dir)
 
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
@@ -571,10 +572,11 @@ async def _create_headful_chromium(
     )
 
     # Set DISPLAY environment variable for the browser process (for VNC support)
-    _apply_display_env(browser_args, kwargs.get("display_number"))
+    display_number_raw = cast(int | None, kwargs.get("display_number"))
+    _apply_display_env(browser_args, display_number_raw)
 
     # Clean up stale Chrome lock files if using a persistent user_data_dir
-    if browser_session_dir or browser_profile_id:
+    if user_data_dir or browser_profile_id:
         cleanup_stale_chrome_lock_files(user_data_dir)
 
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
