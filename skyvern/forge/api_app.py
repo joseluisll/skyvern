@@ -57,6 +57,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
     """Lifespan context manager for FastAPI app startup and shutdown."""
 
     LOG.info("Server started")
+
+    # Start streaming service
+    try:
+        await forge_app.STREAMING_SERVICE.start()
+    except Exception:
+        LOG.exception("Failed to start streaming service")
+
     if forge_app.api_app_startup_event:
         LOG.info("Calling api app startup event")
         try:
@@ -70,6 +77,13 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None, Any]:
             await forge_app.api_app_shutdown_event()
         except Exception:
             LOG.exception("Failed to execute api app shutdown event")
+
+    # Stop streaming service
+    try:
+        await forge_app.STREAMING_SERVICE.stop()
+    except Exception:
+        LOG.exception("Failed to stop streaming service")
+
     LOG.info("Server shutting down")
 
 

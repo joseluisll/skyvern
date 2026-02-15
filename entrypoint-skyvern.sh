@@ -39,11 +39,8 @@ if [ ! -f ".streamlit/secrets.toml" ]; then
     echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
-# Start base VNC display (Xvfb on :99)
-# VncManager will create additional displays for browser sessions with VNC
-source /app/scripts/start_vnc_streaming.sh
-
-python run_streaming.py > /dev/null &
+# Note: VNC streaming (Xvfb, x11vnc, websockify) is now managed by StreamingService
+# which starts automatically on app startup and handles per-session VNC dynamically.
 
 # Run the main application
 python -m skyvern.forge

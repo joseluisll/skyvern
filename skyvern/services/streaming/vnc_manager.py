@@ -23,6 +23,8 @@ class VncProcess:
 
 
 class VncManager:
+    """Manages per-session VNC processes (Xvfb, x11vnc, websockify)."""
+
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
     _instances: ClassVar[dict[str, VncProcess]] = {}
     _used_displays: ClassVar[set[int]] = set()
