@@ -5,11 +5,11 @@ without waiting indefinitely.
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
+
 from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
-from skyvern.config import settings
 
 
-async def test_get_browser_address_local_mode():
+async def test_get_browser_address_local_mode() -> None:
     """Test that get_browser_address returns default address in local mode."""
     # Create a mock database session
     mock_db = MagicMock()
@@ -29,7 +29,7 @@ async def test_get_browser_address_local_mode():
         print("✓ Test passed: get_browser_address returns default address in local mode")
 
 
-async def test_get_browser_address_cloud_mode():
+async def test_get_browser_address_cloud_mode() -> None:
     """Test that get_browser_address calls wait_on_persistent_browser_address in cloud mode."""
     # Create a mock database session
     mock_db = MagicMock()
@@ -52,7 +52,7 @@ async def test_get_browser_address_cloud_mode():
             print("✓ Test passed: get_browser_address calls wait function in cloud mode")
 
 
-async def test_get_browser_address_cloud_mode_none():
+async def test_get_browser_address_cloud_mode_none() -> None:
     """Test that get_browser_address raises MissingBrowserAddressError when address is None in cloud mode."""
     # Create a mock database session
     mock_db = MagicMock()
@@ -78,7 +78,7 @@ async def test_get_browser_address_cloud_mode_none():
                 print("✓ Test passed: get_browser_address raises error when address is None in cloud mode")
 
 
-async def main():
+async def main() -> None:
     """Run all tests."""
     print("Running browser address fix tests...\n")
 

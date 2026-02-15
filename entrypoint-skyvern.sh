@@ -39,15 +39,5 @@ if [ ! -f ".streamlit/secrets.toml" ]; then
     echo ".streamlit/secrets.toml file updated with organization details."
 fi
 
-_kill_xvfb_on_term() {
-  kill -TERM $xvfb
-}
-
-# Setup a trap to catch SIGTERM and relay it to child processes
-trap _kill_xvfb_on_term TERM
-
-# The VNC streaming services (Xvfb, x11vnc, websockify) are now managed by
-# StreamingService.start_monitoring() which is automatically called when the API app starts
-
 # Run the command and pass in all three arguments
 python -m skyvern.forge
