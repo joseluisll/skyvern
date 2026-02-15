@@ -171,13 +171,17 @@ class VncChannel:
             stored = self.browser_session.interactor
             if stored in ("agent", "user"):
                 self._interactor = stored  # type: ignore[assignment]
-                LOG.info(f"{self.class_name} Restored interactor from session: {self._interactor}",
-                         browser_session_id=self.browser_session.persistent_browser_session_id,
-                         organization_id=self.organization_id)
+                LOG.info(
+                    f"{self.class_name} Restored interactor from session: {self._interactor}",
+                    browser_session_id=self.browser_session.persistent_browser_session_id,
+                    organization_id=self.organization_id,
+                )
             else:
-                LOG.warning(f"{self.class_name} Invalid interactor value in database: {stored}, using default",
-                            browser_session_id=self.browser_session.persistent_browser_session_id,
-                            organization_id=self.organization_id)
+                LOG.warning(
+                    f"{self.class_name} Invalid interactor value in database: {stored}, using default",
+                    browser_session_id=self.browser_session.persistent_browser_session_id,
+                    organization_id=self.organization_id,
+                )
                 self._interactor = initial_interactor
         else:
             self._interactor = initial_interactor
@@ -225,11 +229,12 @@ class VncChannel:
                     organization_id=self.organization_id,
                     interactor=value,
                 )
-                LOG.info(f"{self.class_name} Persisted interactor to database: {value}",
-                         browser_session_id=self.browser_session.persistent_browser_session_id)
+                LOG.info(
+                    f"{self.class_name} Persisted interactor to database: {value}",
+                    browser_session_id=self.browser_session.persistent_browser_session_id,
+                )
             except Exception:
-                LOG.exception(f"{self.class_name} Failed to persist interactor to database",
-                              **self.identity)
+                LOG.exception(f"{self.class_name} Failed to persist interactor to database", **self.identity)
 
     @property
     def is_open(self) -> bool:

@@ -20,7 +20,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column("persistent_browser_sessions", sa.Column("interactor", sa.String(), nullable=True, server_default="agent"))
+    op.add_column(
+        "persistent_browser_sessions", sa.Column("interactor", sa.String(), nullable=True, server_default="agent")
+    )
 
 
 def downgrade() -> None:
