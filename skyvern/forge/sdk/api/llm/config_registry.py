@@ -97,6 +97,24 @@ if settings.ENABLE_OPENAI:
         ),
     )
     LLMConfigRegistry.register_config(
+        "OPENAI_GPT5_MINI_FLEX",
+        LLMConfig(
+            "gpt-5-mini-2025-08-07",
+            ["OPENAI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=128000,
+            temperature=1,  # GPT-5 only supports temperature=1
+            reasoning_effort=settings.GPT5_REASONING_EFFORT,
+            litellm_params=LiteLLMParams(
+                api_key=settings.OPENAI_API_KEY,
+                model_info={"model_name": "gpt-5-mini-2025-08-07"},
+                service_tier="flex",
+                timeout=900.0,
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
         "OPENAI_GPT5_NANO",
         LLMConfig(
             "gpt-5-nano-2025-08-07",
@@ -359,6 +377,16 @@ if settings.ENABLE_ANTHROPIC:
             max_completion_tokens=64000,
         ),
     )
+    LLMConfigRegistry.register_config(
+        "ANTHROPIC_CLAUDE4.5_OPUS",
+        LLMConfig(
+            "anthropic/claude-opus-4-5-20251101",
+            ["ANTHROPIC_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
+        ),
+    )
 
 if settings.ENABLE_BEDROCK:
     # Supported through AWS IAM authentication
@@ -474,6 +502,26 @@ if settings.ENABLE_BEDROCK:
             supports_vision=True,
             add_assistant_prefix=True,
             max_completion_tokens=32000,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.5_SONNET_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "BEDROCK_ANTHROPIC_CLAUDE4.5_OPUS_INFERENCE_PROFILE",
+        LLMConfig(
+            "bedrock/us.anthropic.claude-opus-4-5-20251101-v1:0",
+            ["AWS_REGION"],
+            supports_vision=True,
+            add_assistant_prefix=True,
+            max_completion_tokens=64000,
         ),
     )
 
@@ -944,6 +992,19 @@ if settings.ENABLE_GEMINI:
                     "budget_tokens": settings.GEMINI_THINKING_BUDGET,
                     "type": "enabled" if settings.GEMINI_INCLUDE_THOUGHT else None,
                 },
+            ),
+        ),
+    )
+    LLMConfigRegistry.register_config(
+        "GEMINI_3.0_FLASH",
+        LLMConfig(
+            "gemini/gemini-3-flash-preview",
+            ["GEMINI_API_KEY"],
+            supports_vision=True,
+            add_assistant_prefix=False,
+            max_completion_tokens=65536,
+            litellm_params=LiteLLMParams(
+                thinking_level="medium" if settings.GEMINI_INCLUDE_THOUGHT else "minimal",
             ),
         ),
     )

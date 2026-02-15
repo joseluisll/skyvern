@@ -2,11 +2,13 @@ import { AxiosError } from "axios";
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   MutableRefObject,
 } from "react";
 import { nanoid } from "nanoid";
+import { stringify as convertToYAML } from "yaml";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -56,6 +58,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/use-toast";
+import { DeleteConfirmationDialog } from "@/components/DeleteConfirmationDialog";
 import { BrowserStream } from "@/components/BrowserStream";
 import { statusIsFinalized } from "@/routes/tasks/types.ts";
 import { CodeEditor } from "@/routes/workflows/components/CodeEditor";
@@ -70,8 +73,10 @@ import {
   useWorkflowHasChangesStore,
   useWorkflowSave,
 } from "@/store/WorkflowHasChangesStore";
+import { useWorkflowParametersStore } from "@/store/WorkflowParametersStore";
 import { getCode, getOrderedBlockLabels } from "@/routes/workflows/utils";
 import { DebuggerBlockRuns } from "@/routes/workflows/debugger/DebuggerBlockRuns";
+import { copyText } from "@/util/copyText";
 import { cn } from "@/util/utils";
 
 import { FlowRenderer, type FlowRendererProps } from "./FlowRenderer";
@@ -81,7 +86,12 @@ import { WorkflowNodeLibraryPanel } from "./panels/WorkflowNodeLibraryPanel";
 import { WorkflowParametersPanel } from "./panels/WorkflowParametersPanel";
 import { WorkflowCacheKeyValuesPanel } from "./panels/WorkflowCacheKeyValuesPanel";
 import { WorkflowComparisonPanel } from "./panels/WorkflowComparisonPanel";
-import { getWorkflowErrors, getElements } from "./workflowEditorUtils";
+import {
+  getWorkflowErrors,
+  getElements,
+  getAffectedBlocks,
+  getOutputParameterKey,
+} from "./workflowEditorUtils";
 import { WorkflowHeader } from "./WorkflowHeader";
 import { WorkflowHistoryPanel } from "./panels/WorkflowHistoryPanel";
 import { WorkflowVersion } from "../hooks/useWorkflowVersionsQuery";
@@ -95,7 +105,11 @@ import {
   layout,
   startNode,
 } from "./workflowEditorUtils";
-import { constructCacheKeyValue } from "./utils";
+import { constructCacheKeyValue, getInitialParameters } from "./utils";
+import { WorkflowCopilotChat } from "../copilot/WorkflowCopilotChat";
+import { WorkflowCopilotButton } from "../copilot/WorkflowCopilotButton";
+import type { CopilotReviewStatus } from "./panels/WorkflowComparisonPanel";
+import type { WorkflowYAMLConversionResponse } from "../copilot/workflowCopilotTypes";
 import "./workspace-styles.css";
 
 const Constants = {
@@ -183,8 +197,8 @@ function CopyAndExplainCode({ code }: { code: string }) {
 function CopyText({ className, text }: { className?: string; text: string }) {
   const [wasCopied, setWasCopied] = useState(false);
 
-  function handleCopy(code: string) {
-    navigator.clipboard.writeText(code);
+  async function handleCopy(code: string) {
+    await copyText(code);
     setWasCopied(true);
     setTimeout(() => setWasCopied(false), 2000);
   }
@@ -226,19 +240,16 @@ function Workspace({
   const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
   const { getNodes, getEdges } = useReactFlow();
   const saveWorkflow = useWorkflowSave({ status: "published" });
-
   const { data: workflowRun } = useWorkflowRunQuery();
   const isFinalized = workflowRun ? statusIsFinalized(workflowRun) : false;
 
   const [openCycleBrowserDialogue, setOpenCycleBrowserDialogue] =
     useState(false);
-  const [toDeleteCacheKeyValue, setToDeleteCacheKeyValue] = useState<
-    string | null
-  >(null);
-  const [
-    openConfirmCacheKeyValueDeleteDialogue,
-    setOpenConfirmCacheKeyValueDeleteDialogue,
-  ] = useState(false);
+  const [isCopilotOpen, setIsCopilotOpen] = useState(
+    () => !initialNodes.some(isWorkflowBlockNode),
+  );
+  const [copilotMessageCount, setCopilotMessageCount] = useState(0);
+  const copilotButtonRef = useRef<HTMLButtonElement>(null);
   const [activeDebugSession, setActiveDebugSession] =
     useState<DebugSessionApiResponse | null>(null);
   const [showPowerButton, setShowPowerButton] = useState(true);
@@ -252,6 +263,39 @@ function Workspace({
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
   const cacheKey = workflow?.cache_key ?? "";
+
+  // Block delete confirmation dialog state
+  const [deleteBlockDialogState, setDeleteBlockDialogState] = useState<{
+    open: boolean;
+    nodeId: string | null;
+    nodeLabel: string | null;
+  }>({
+    open: false,
+    nodeId: null,
+    nodeLabel: null,
+  });
+  // Use a ref for the callback to avoid storing functions in state
+  const deleteConfirmCallbackRef = useRef<(() => void) | null>(null);
+
+  const affectedBlocksForDelete = useMemo(() => {
+    if (!deleteBlockDialogState.nodeLabel) {
+      return [];
+    }
+    const outputKey = getOutputParameterKey(deleteBlockDialogState.nodeLabel);
+    return getAffectedBlocks(nodes, outputKey);
+  }, [nodes, deleteBlockDialogState.nodeLabel]);
+
+  const handleRequestDeleteNode = useCallback(
+    (nodeId: string, nodeLabel: string, confirmCallback: () => void) => {
+      deleteConfirmCallbackRef.current = confirmCallback;
+      setDeleteBlockDialogState({
+        open: true,
+        nodeId,
+        nodeLabel,
+      });
+    },
+    [],
+  );
 
   const [cacheKeyValue, setCacheKeyValue] = useState(
     cacheKey === ""
@@ -583,8 +627,6 @@ function Workspace({
       queryClient.invalidateQueries({
         queryKey: ["cache-key-values", workflowPermanentId, cacheKey],
       });
-      setToDeleteCacheKeyValue(null);
-      setOpenConfirmCacheKeyValueDeleteDialogue(false);
     },
     onError: (error: AxiosError) => {
       toast({
@@ -592,8 +634,6 @@ function Workspace({
         title: "Failed to delete code key value",
         description: error.message,
       });
-      setToDeleteCacheKeyValue(null);
-      setOpenConfirmCacheKeyValueDeleteDialogue(false);
     },
   });
 
@@ -657,11 +697,11 @@ function Workspace({
 
   const doLayout = useCallback(
     (nodes: Array<AppNode>, edges: Array<Edge>) => {
-      const layoutedElements = layout(nodes, edges);
+      const layoutedElements = layout(nodes, edges, blockLabel);
       setNodes(layoutedElements.nodes);
       setEdges(layoutedElements.edges);
     },
-    [setNodes, setEdges],
+    [setNodes, setEdges, blockLabel],
   );
 
   // Listen for conditional branch changes to trigger re-layout
@@ -673,7 +713,7 @@ function Workspace({
         const currentNodes = getNodes() as Array<AppNode>;
         const currentEdges = getEdges();
 
-        const layoutedElements = layout(currentNodes, currentEdges);
+        const layoutedElements = layout(currentNodes, currentEdges, blockLabel);
         setNodes(layoutedElements.nodes);
         setEdges(layoutedElements.edges);
       }, 10); // Small delay to ensure visibility updates complete
@@ -686,7 +726,7 @@ function Workspace({
         handleBranchChange,
       );
     };
-  }, [getNodes, getEdges, setNodes, setEdges]);
+  }, [getNodes, getEdges, setNodes, setEdges, blockLabel]);
 
   function addNode({
     nodeType,
@@ -935,6 +975,40 @@ function Workspace({
     }
   };
 
+  const applyWorkflowUpdate = (workflowData: WorkflowVersion) => {
+    const settings: WorkflowSettings = {
+      proxyLocation: workflowData.proxy_location ?? ProxyLocation.Residential,
+      webhookCallbackUrl: workflowData.webhook_callback_url || "",
+      persistBrowserSession: workflowData.persist_browser_session ?? false,
+      model: workflowData.model ?? null,
+      maxScreenshotScrolls: workflowData.max_screenshot_scrolls || 3,
+      extraHttpHeaders: workflowData.extra_http_headers
+        ? JSON.stringify(workflowData.extra_http_headers)
+        : null,
+      runWith: workflowData.run_with ?? null,
+      scriptCacheKey: workflowData.cache_key ?? null,
+      aiFallback: workflowData.ai_fallback ?? true,
+      runSequentially: workflowData.run_sequentially ?? false,
+      sequentialKey: workflowData.sequential_key ?? null,
+      finallyBlockLabel:
+        workflowData.workflow_definition?.finally_block_label ?? null,
+    };
+
+    const elements = getElements(
+      workflowData.workflow_definition.blocks,
+      settings,
+      true,
+    );
+
+    setNodes(elements.nodes);
+    setEdges(elements.edges);
+
+    const initialParameters = getInitialParameters(workflowData);
+    useWorkflowParametersStore.getState().setParameters(initialParameters);
+
+    workflowChangesStore.setHasChanges(true);
+  };
+
   const handleSelectState = (selectedVersion: WorkflowVersion) => {
     // Close panels
     setWorkflowPanelState({
@@ -950,7 +1024,7 @@ function Workspace({
     // Load the selected version into the main editor
     const settings: WorkflowSettings = {
       proxyLocation:
-        selectedVersion.proxy_location || ProxyLocation.Residential,
+        selectedVersion.proxy_location ?? ProxyLocation.Residential,
       webhookCallbackUrl: selectedVersion.webhook_callback_url || "",
       persistBrowserSession: selectedVersion.persist_browser_session,
       model: selectedVersion.model,
@@ -963,6 +1037,8 @@ function Workspace({
       aiFallback: selectedVersion.ai_fallback ?? true,
       runSequentially: selectedVersion.run_sequentially ?? false,
       sequentialKey: selectedVersion.sequential_key ?? null,
+      finallyBlockLabel:
+        selectedVersion.workflow_definition?.finally_block_label ?? null,
     };
 
     const elements = getElements(
@@ -1060,65 +1136,6 @@ function Workspace({
         </DialogContent>
       </Dialog>
 
-      {/* cache key value delete dialog */}
-      <Dialog
-        open={openConfirmCacheKeyValueDeleteDialogue}
-        onOpenChange={(open) => {
-          if (!open && deleteCacheKeyValue.isPending) {
-            return;
-          }
-          setOpenConfirmCacheKeyValueDeleteDialogue(open);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Generated Code</DialogTitle>
-            <DialogDescription>
-              <div className="w-full pb-2 pt-4 text-sm text-slate-400">
-                {deleteCacheKeyValue.isPending ? (
-                  "Deleting generated code..."
-                ) : (
-                  <div className="flex w-full flex-col gap-2">
-                    <div className="w-full">
-                      Are you sure you want to delete the generated code for
-                      this code key value?
-                    </div>
-                    <div
-                      className="max-w-[29rem] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-bold text-slate-400"
-                      title={toDeleteCacheKeyValue ?? undefined}
-                    >
-                      {toDeleteCacheKeyValue}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            {!deleteCacheKeyValue.isPending && (
-              <DialogClose asChild>
-                <Button variant="secondary">Cancel</Button>
-              </DialogClose>
-            )}
-            <Button
-              variant="default"
-              onClick={() => {
-                deleteCacheKeyValue.mutate({
-                  workflowPermanentId: workflowPermanentId!,
-                  cacheKeyValue: toDeleteCacheKeyValue!,
-                });
-              }}
-              disabled={deleteCacheKeyValue.isPending}
-            >
-              Yes, Continue{" "}
-              {deleteCacheKeyValue.isPending && (
-                <ReloadIcon className="ml-2 size-4 animate-spin" />
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
       {/* header panel */}
       <div className="absolute left-6 right-6 top-8 z-40 h-20">
         <WorkflowHeader
@@ -1191,7 +1208,9 @@ function Workspace({
           <div
             className="absolute left-6 top-[6rem]"
             style={{
-              width: "calc(100% - 32rem)",
+              width: workflowPanelState.active
+                ? "calc(100% - 32rem)"
+                : "calc(100% - 3rem)",
               height: "calc(100vh - 11rem)",
             }}
           >
@@ -1200,6 +1219,10 @@ function Workspace({
               version1={workflowPanelState.data.version1}
               version2={workflowPanelState.data.version2}
               onSelectState={handleSelectState}
+              mode={workflowPanelState.data.mode}
+              onCopilotReviewClose={
+                workflowPanelState.data.onCopilotReviewClose
+              }
             />
           </div>
 
@@ -1220,8 +1243,10 @@ function Workspace({
                   pending={cacheKeyValuesLoading}
                   scriptKey={workflow.cache_key ?? "default"}
                   onDelete={(cacheKeyValue) => {
-                    setToDeleteCacheKeyValue(cacheKeyValue);
-                    setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                    deleteCacheKeyValue.mutate({
+                      workflowPermanentId: workflowPermanentId!,
+                      cacheKeyValue,
+                    });
                   }}
                   onPaginate={(page) => {
                     setPage(page);
@@ -1273,6 +1298,7 @@ function Workspace({
                 onEdgesChange={onEdgesChange}
                 initialTitle={initialTitle}
                 workflow={workflow}
+                onRequestDeleteNode={handleRequestDeleteNode}
               />
 
               {/* sub panels */}
@@ -1292,8 +1318,10 @@ function Workspace({
                       pending={cacheKeyValuesLoading}
                       scriptKey={workflow.cache_key ?? "default"}
                       onDelete={(cacheKeyValue) => {
-                        setToDeleteCacheKeyValue(cacheKeyValue);
-                        setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                        deleteCacheKeyValue.mutate({
+                          workflowPermanentId: workflowPermanentId!,
+                          cacheKeyValue,
+                        });
                       }}
                       onPaginate={(page) => {
                         setPage(page);
@@ -1346,8 +1374,10 @@ function Workspace({
                 pending={cacheKeyValuesLoading}
                 scriptKey={workflow.cache_key ?? "default"}
                 onDelete={(cacheKeyValue) => {
-                  setToDeleteCacheKeyValue(cacheKeyValue);
-                  setOpenConfirmCacheKeyValueDeleteDialogue(true);
+                  deleteCacheKeyValue.mutate({
+                    workflowPermanentId: workflowPermanentId!,
+                    cacheKeyValue,
+                  });
                 }}
                 onPaginate={(page) => {
                   setPage(page);
@@ -1363,10 +1393,12 @@ function Workspace({
               <WorkflowParametersPanel />
             )}
             {workflowPanelState.content === "history" && (
-              <WorkflowHistoryPanel
-                workflowPermanentId={workflowPermanentId!}
-                onCompare={handleCompareVersions}
-              />
+              <div className="h-[calc(100vh-14rem)]">
+                <WorkflowHistoryPanel
+                  workflowPermanentId={workflowPermanentId!}
+                  onCompare={handleCompareVersions}
+                />
+              </div>
             )}
           </div>
         )}
@@ -1438,6 +1470,7 @@ function Workspace({
                     initialTitle={initialTitle}
                     workflow={workflow}
                     onContainerResize={containerResizeTrigger}
+                    onRequestDeleteNode={handleRequestDeleteNode}
                   />
                 </div>
               </div>
@@ -1485,6 +1518,11 @@ function Workspace({
                       />
                     </div>
                     <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                      <WorkflowCopilotButton
+                        ref={copilotButtonRef}
+                        messageCount={copilotMessageCount}
+                        onClick={() => setIsCopilotOpen((prev) => !prev)}
+                      />
                       <div className="flex items-center gap-2">
                         <GlobeIcon /> Live Browser
                       </div>
@@ -1514,9 +1552,18 @@ function Workspace({
                 {activeDebugSession &&
                   !activeDebugSession.vnc_streaming_supported && (
                     <div className="skyvern-screenshot-browser flex h-full w-[calc(100%_-_6rem)] flex-1 flex-col items-center justify-center">
-                      <div className="aspect-video w-full">
-                        <WorkflowRunStream alwaysShowStream={true} />
+                      <div className="flex w-full flex-1 items-center justify-center">
+                        <div className="aspect-video w-full">
+                          <WorkflowRunStream alwaysShowStream={true} />
+                        </div>
                       </div>
+                      <footer className="flex h-[2rem] w-full items-center justify-start gap-4">
+                        <WorkflowCopilotButton
+                          ref={copilotButtonRef}
+                          messageCount={copilotMessageCount}
+                          onClick={() => setIsCopilotOpen((prev) => !prev)}
+                        />
+                      </footer>
                     </div>
                   )}
 
@@ -1626,6 +1673,184 @@ function Workspace({
           </Splitter>
         </div>
       )}
+
+      <WorkflowCopilotChat
+        isOpen={isCopilotOpen}
+        onClose={() => setIsCopilotOpen(false)}
+        onMessageCountChange={setCopilotMessageCount}
+        buttonRef={copilotButtonRef}
+        onReviewWorkflow={async (pendingWorkflow, clearPending) => {
+          const saveData = workflowChangesStore.getSaveData?.();
+          if (!saveData) return;
+
+          try {
+            // Create YAML from current workflow definition only
+            const workflowDefinitionYaml = convertToYAML({
+              version: saveData.workflowDefinitionVersion,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+              finally_block_label:
+                saveData.settings.finallyBlockLabel ?? undefined,
+            });
+
+            // Convert current workflow definition YAML to blocks
+            const client = await getClient(credentialGetter, "sans-api-v1");
+
+            const currentConversionResponse =
+              await client.post<WorkflowYAMLConversionResponse>(
+                "/workflow/copilot/convert-yaml-to-blocks",
+                {
+                  workflow_definition_yaml: workflowDefinitionYaml,
+                  workflow_id: saveData.workflow.workflow_id,
+                },
+              );
+
+            // Construct WorkflowVersion for current state with converted blocks
+            const currentVersion: WorkflowVersion = {
+              workflow_id: saveData.workflow.workflow_id,
+              organization_id: "",
+              is_saved_task: saveData.workflow.is_saved_task ?? false,
+              is_template: false,
+              title: "Current",
+              workflow_permanent_id: saveData.workflow.workflow_permanent_id,
+              version: saveData.workflow.version ?? 0,
+              description: saveData.workflow.description ?? "",
+              workflow_definition:
+                currentConversionResponse.data.workflow_definition,
+              proxy_location: saveData.settings.proxyLocation,
+              webhook_callback_url: saveData.settings.webhookCallbackUrl,
+              extra_http_headers: saveData.settings.extraHttpHeaders
+                ? JSON.parse(saveData.settings.extraHttpHeaders)
+                : null,
+              persist_browser_session: saveData.settings.persistBrowserSession,
+              model: saveData.settings.model,
+              totp_verification_url: saveData.workflow.totp_verification_url,
+              totp_identifier: null,
+              max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+              status: saveData.workflow.status,
+              created_at: new Date().toISOString(),
+              modified_at: new Date().toISOString(),
+              deleted_at: null,
+              run_with: saveData.settings.runWith,
+              cache_key: saveData.settings.scriptCacheKey,
+              ai_fallback: saveData.settings.aiFallback,
+              run_sequentially: saveData.settings.runSequentially,
+              sequential_key: saveData.settings.sequentialKey,
+              folder_id: null,
+              import_error: null,
+            };
+
+            // Construct fake WorkflowVersion for pending copilot suggestion
+            const pendingVersion: WorkflowVersion = {
+              ...pendingWorkflow,
+              title: "Copilot Suggestion",
+            };
+
+            // Handle copilot review close with status
+            const handleCopilotReviewClose = (status: CopilotReviewStatus) => {
+              if (status === "approve") {
+                try {
+                  applyWorkflowUpdate(pendingWorkflow);
+                } catch (error) {
+                  console.error(
+                    "Failed to apply copilot workflow",
+                    error,
+                    pendingWorkflow,
+                  );
+                  toast({
+                    title: "Update failed",
+                    description:
+                      "Failed to apply workflow update. Please try again.",
+                    variant: "destructive",
+                  });
+                }
+              }
+
+              // Close the panel and reopen copilot chat
+              setWorkflowPanelState({
+                active: false,
+                content: "history",
+                data: {
+                  showComparison: false,
+                  version1: undefined,
+                  version2: undefined,
+                },
+              });
+              setIsCopilotOpen(true);
+
+              // Clear pending for approve and reject, but not for close
+              if (status !== "close") {
+                clearPending();
+              }
+            };
+
+            // Hide chat and show comparison
+            setIsCopilotOpen(false);
+            setWorkflowPanelState({
+              active: false,
+              content: "history",
+              data: {
+                version1: currentVersion,
+                version2: pendingVersion,
+                showComparison: true,
+                mode: "copilot",
+                onCopilotReviewClose: handleCopilotReviewClose,
+              },
+            });
+          } catch (error) {
+            console.error("Failed to prepare workflow comparison", error);
+            toast({
+              title: "Comparison failed",
+              description:
+                "Failed to prepare workflow for comparison. Please try again.",
+              variant: "destructive",
+            });
+          }
+        }}
+        onWorkflowUpdate={(workflowData) => {
+          try {
+            applyWorkflowUpdate(workflowData);
+          } catch (error) {
+            console.error(
+              "Failed to parse and apply workflow",
+              error,
+              workflowData,
+            );
+            toast({
+              title: "Update failed",
+              description: "Failed to apply workflow update. Please try again.",
+              variant: "destructive",
+            });
+          }
+        }}
+      />
+      <DeleteConfirmationDialog
+        open={deleteBlockDialogState.open}
+        onOpenChange={(open) => {
+          if (!open) {
+            deleteConfirmCallbackRef.current = null;
+            setDeleteBlockDialogState({
+              open: false,
+              nodeId: null,
+              nodeLabel: null,
+            });
+          }
+        }}
+        title="Delete Block"
+        description={`Are you sure you want to delete "${deleteBlockDialogState.nodeLabel}"?`}
+        affectedBlocks={affectedBlocksForDelete}
+        onConfirm={() => {
+          if (deleteConfirmCallbackRef.current) {
+            deleteConfirmCallbackRef.current();
+          }
+          deleteConfirmCallbackRef.current = null;
+          setDeleteBlockDialogState({
+            open: false,
+            nodeId: null,
+            nodeLabel: null,
+          });
+        }}
+      />
     </div>
   );
 }

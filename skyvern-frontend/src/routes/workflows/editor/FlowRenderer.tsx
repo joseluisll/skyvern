@@ -36,7 +36,8 @@ import {
 import "@xyflow/react/dist/style.css";
 import { nanoid } from "nanoid";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useBlocker } from "react-router-dom";
+import { useDebouncedCallback } from "use-debounce";
+import { useBlocker, useParams } from "react-router-dom";
 import {
   AWSSecretParameter,
   debuggableWorkflowBlockTypes,
@@ -88,11 +89,14 @@ import {
   getWorkflowBlocks,
   getWorkflowSettings,
   layout,
+  removeJinjaReferenceFromNodes,
+  removeKeyFromNodesParameterKeys,
   upgradeWorkflowDefinitionToVersionTwo,
 } from "./workflowEditorUtils";
 import { getWorkflowErrors } from "./workflowEditorUtils";
 import { toast } from "@/components/ui/use-toast";
 import { useAutoPan } from "./useAutoPan";
+import { useAutoGenerateWorkflowTitle } from "../hooks/useAutoGenerateWorkflowTitle";
 
 function convertToParametersYAML(
   parameters: ParametersState,
@@ -281,6 +285,11 @@ type Props = {
   onMouseDownCapture?: () => void;
   zIndex?: number;
   onContainerResize?: number;
+  onRequestDeleteNode?: (
+    nodeId: string,
+    nodeLabel: string,
+    confirmCallback: () => void,
+  ) => void;
 };
 
 function FlowRenderer({
@@ -299,7 +308,9 @@ function FlowRenderer({
   onMouseDownCapture,
   zIndex,
   onContainerResize,
+  onRequestDeleteNode,
 }: Props) {
+  const { blockLabel: targettedBlockLabel } = useParams();
   const reactFlowInstance = useReactFlow();
   const debugStore = useDebugStore();
   const { title, initializeTitle } = useWorkflowTitleStore();
@@ -311,6 +322,9 @@ function FlowRenderer({
 
   // Track if this is the initial load to prevent false "unsaved changes" detection
   const isInitialLoadRef = useRef(true);
+
+  // Track if we're currently in a layout operation to prevent infinite loops
+  const isLayoutingRef = useRef(false);
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -346,11 +360,35 @@ function FlowRenderer({
     );
   });
 
-  function doLayout(nodes: Array<AppNode>, edges: Array<Edge>) {
-    const layoutedElements = layout(nodes, edges);
-    setNodes(layoutedElements.nodes);
-    setEdges(layoutedElements.edges);
-  }
+  const doLayout = useCallback(
+    (nodes: Array<AppNode>, edges: Array<Edge>) => {
+      const layoutedElements = layout(nodes, edges, targettedBlockLabel);
+      setNodes(layoutedElements.nodes);
+      setEdges(layoutedElements.edges);
+    },
+    [setNodes, setEdges, targettedBlockLabel],
+  );
+
+  // Debounced layout for dimension changes to prevent infinite loops (React error #185)
+  // when copy-pasting triggers rapid successive dimension changes
+  const debouncedLayoutForDimensions = useDebouncedCallback(
+    (tempNodes: Array<AppNode>, currentEdges: Array<Edge>) => {
+      if (isLayoutingRef.current) {
+        return;
+      }
+      isLayoutingRef.current = true;
+      try {
+        doLayout(tempNodes, currentEdges);
+      } finally {
+        // Reset the flag after a short delay to allow React to flush updates
+        requestAnimationFrame(() => {
+          isLayoutingRef.current = false;
+        });
+      }
+    },
+    50,
+    { leading: true, trailing: true, maxWait: 200 },
+  );
 
   useEffect(() => {
     if (nodesInitialized) {
@@ -358,6 +396,15 @@ function FlowRenderer({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodesInitialized]);
+
+  // Re-layout when the targetted block changes to account for the status row
+  // that appears when a block is being debugged
+  useEffect(() => {
+    if (nodesInitialized && targettedBlockLabel) {
+      doLayout(nodes, edges);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targettedBlockLabel]);
 
   useEffect(() => {
     const topLevelBlocks = getWorkflowBlocks(nodes, edges);
@@ -445,96 +492,92 @@ function FlowRenderer({
     return true;
   }
 
-  function deleteNode(id: string) {
-    const node = nodes.find((node) => node.id === id);
-    if (!node || !isWorkflowBlockNode(node)) {
-      return;
-    }
-    const nodesToDelete = descendants(nodes, id);
-    const deletedNodeLabel = node.data.label;
-    const newNodes = nodes.filter(
-      (node) => !nodesToDelete.includes(node) && node.id !== id,
-    );
-    const newEdges = edges.flatMap((edge) => {
-      if (edge.source === id) {
-        return [];
+  const deleteNode = useCallback(
+    (id: string) => {
+      const node = nodes.find((node) => node.id === id);
+      if (!node || !isWorkflowBlockNode(node)) {
+        return;
       }
-      if (
-        nodesToDelete.some(
-          (node) => node.id === edge.source || node.id === edge.target,
-        )
-      ) {
-        return [];
-      }
-      if (edge.target === id) {
-        const nextEdge = edges.find((edge) => edge.source === id);
-        if (nextEdge) {
-          // connect the old incoming edge to the next node if both of them exist
-          // also take the type of the old edge for plus button edge vs default
-          return [
-            {
-              ...edge,
-              type: nextEdge.type,
-              target: nextEdge.target,
-            },
-          ];
+      const nodesToDelete = descendants(nodes, id);
+      const deletedNodeLabel = node.data.label;
+      const newNodes = nodes.filter(
+        (node) => !nodesToDelete.includes(node) && node.id !== id,
+      );
+      const newEdges = edges.flatMap((edge) => {
+        if (edge.source === id) {
+          return [];
+        }
+        if (
+          nodesToDelete.some(
+            (node) => node.id === edge.source || node.id === edge.target,
+          )
+        ) {
+          return [];
+        }
+        if (edge.target === id) {
+          const nextEdge = edges.find((edge) => edge.source === id);
+          if (nextEdge) {
+            // connect the old incoming edge to the next node if both of them exist
+            // also take the type of the old edge for plus button edge vs default
+            return [
+              {
+                ...edge,
+                type: nextEdge.type,
+                target: nextEdge.target,
+              },
+            ];
+          }
+          return [edge];
         }
         return [edge];
-      }
-      return [edge];
-    });
+      });
 
-    if (newNodes.every((node) => node.type === "nodeAdder")) {
-      // No user created nodes left, so return to the empty state.
-      doLayout([], []);
-      return;
-    }
+      if (newNodes.every((node) => node.type === "nodeAdder")) {
+        // No user created nodes left, so return to the empty state.
+        doLayout([], []);
+        return;
+      }
 
-    // if any node was using the output parameter of the deleted node, remove it from their parameter keys
-    const newNodesWithUpdatedParameters = newNodes.map((node) => {
-      if (node.type === "task") {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            parameterKeys: node.data.parameterKeys.filter(
-              (parameter) =>
-                parameter !== getOutputParameterKey(deletedNodeLabel),
-            ),
-          },
-        };
-      }
-      // TODO: Fix this. When we put these into the same if statement TS fails to recognize that the returned value fits both the task and text prompt node types
-      if (node.type === "textPrompt") {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            parameterKeys: node.data.parameterKeys.filter(
-              (parameter) =>
-                parameter !== getOutputParameterKey(deletedNodeLabel),
-            ),
-          },
-        };
-      }
-      if (node.type === "loop") {
-        return {
-          ...node,
-          data: {
-            ...node.data,
-            loopValue:
-              node.data.loopValue === getOutputParameterKey(deletedNodeLabel)
-                ? ""
-                : node.data.loopValue,
-          },
-        };
-      }
-      return node;
-    });
-    workflowChangesStore.setHasChanges(true);
+      // Step 1: Remove inline {{ deleted_block_output }} references from all nodes
+      const deletedOutputKey = getOutputParameterKey(deletedNodeLabel);
+      const nodesWithRemovedInlineRefs = removeJinjaReferenceFromNodes(
+        newNodes,
+        deletedOutputKey,
+      );
 
-    doLayout(newNodesWithUpdatedParameters, newEdges);
-  }
+      // Step 2: Remove from parameterKeys arrays and handle special cases
+      const newNodesWithUpdatedParameters = removeKeyFromNodesParameterKeys(
+        nodesWithRemovedInlineRefs,
+        deletedOutputKey,
+        deletedNodeLabel,
+      );
+
+      workflowChangesStore.setHasChanges(true);
+
+      doLayout(newNodesWithUpdatedParameters, newEdges);
+    },
+    [nodes, edges, doLayout, workflowChangesStore],
+  );
+
+  // Use a ref to always have access to the latest deleteNode without causing re-renders
+  const deleteNodeRef = useRef(deleteNode);
+  useEffect(() => {
+    deleteNodeRef.current = deleteNode;
+  }, [deleteNode]);
+
+  // Callback for requesting node deletion (opens confirmation dialog in parent)
+  // Uses ref to avoid recreating on every nodes/edges change while still using latest deleteNode
+  const requestDeleteNode = useCallback(
+    (id: string, label: string) => {
+      if (onRequestDeleteNode) {
+        onRequestDeleteNode(id, label, () => deleteNodeRef.current(id));
+      } else {
+        // Fallback: delete directly if no confirmation handler provided
+        deleteNodeRef.current(id);
+      }
+    },
+    [onRequestDeleteNode],
+  );
 
   function transmuteNode(id: string, nodeType: string) {
     const nodeToTransmute = nodes.find((node) => node.id === id);
@@ -698,6 +741,7 @@ function FlowRenderer({
   const editorElementRef = useRef<HTMLDivElement>(null);
 
   useAutoPan(editorElementRef, nodes);
+  useAutoGenerateWorkflowTitle(nodes, edges);
 
   useEffect(() => {
     doLayout(nodes, edges);
@@ -819,13 +863,7 @@ function FlowRenderer({
       </Dialog>
       <BlockActionContext.Provider
         value={{
-          /**
-           * NOTE: defer deletion to next tick to allow React Flow's internal
-           * event handlers to complete; removes a console warning from the
-           * React Flow library
-           */
-          deleteNodeCallback: (id: string) =>
-            setTimeout(() => deleteNode(id), 0),
+          requestDeleteNodeCallback: requestDeleteNode,
           transmuteNodeCallback: (id: string, nodeName: string) =>
             setTimeout(() => transmuteNode(id, nodeName), 0),
           toggleScriptForNodeCallback: toggleScript,
@@ -839,26 +877,47 @@ function FlowRenderer({
             const dimensionChanges = changes.filter(
               (change) => change.type === "dimensions",
             );
-            const tempNodes = [...nodes];
-            dimensionChanges.forEach((change) => {
-              const node = tempNodes.find((node) => node.id === change.id);
-              if (node) {
-                if (node.measured?.width) {
-                  node.measured.width = change.dimensions?.width;
-                }
-                if (node.measured?.height) {
-                  node.measured.height = change.dimensions?.height;
-                }
-              }
-            });
 
-            if (dimensionChanges.length > 0) {
-              doLayout(tempNodes, edges);
+            // Only process dimension changes if we're not already in a layout operation
+            // This prevents infinite loops (React error #185) during copy-paste
+            if (dimensionChanges.length > 0 && !isLayoutingRef.current) {
+              const tempNodes = [...nodes];
+              let hasActualChanges = false;
+
+              dimensionChanges.forEach((change) => {
+                const node = tempNodes.find((node) => node.id === change.id);
+                if (node) {
+                  const newWidth = change.dimensions?.width;
+                  const newHeight = change.dimensions?.height;
+
+                  // Only update if dimensions actually changed
+                  if (
+                    node.measured?.width !== newWidth ||
+                    node.measured?.height !== newHeight
+                  ) {
+                    hasActualChanges = true;
+                    if (node.measured) {
+                      node.measured.width = newWidth;
+                      node.measured.height = newHeight;
+                    }
+                  }
+                }
+              });
+
+              // Only trigger layout if there were actual dimension changes
+              if (hasActualChanges) {
+                debouncedLayoutForDimensions(tempNodes, edges);
+              }
             }
 
-            // Only track changes after initial load is complete
+            // Only track changes after initial load is complete and not during internal updates
+            // (e.g., switching conditional branches which is UI state, not workflow data)
+            // Use getState() to get real-time value (not stale closure from render time)
+            const isInternalUpdate =
+              useWorkflowHasChangesStore.getState().isInternalUpdate;
             if (
               !isInitialLoadRef.current &&
+              !isInternalUpdate &&
               changes.some((change) => {
                 return (
                   change.type === "add" ||

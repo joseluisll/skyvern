@@ -33,6 +33,8 @@ class HttpRequestBlock(UniversalBaseModel):
     files: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None
     timeout: typing.Optional[int] = None
     follow_redirects: typing.Optional[bool] = None
+    download_filename: typing.Optional[str] = None
+    save_response_as_file: typing.Optional[bool] = None
     parameters: typing.Optional[typing.List[HttpRequestBlockParametersItem]] = None
 
     if IS_PYDANTIC_V2:

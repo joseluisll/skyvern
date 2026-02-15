@@ -1,5 +1,14 @@
-import { Handle, Node, NodeProps, Position, useReactFlow } from "@xyflow/react";
+import {
+  Handle,
+  Node,
+  NodeProps,
+  Position,
+  useEdges,
+  useNodes,
+  useReactFlow,
+} from "@xyflow/react";
 import type { StartNode } from "./types";
+import { AppNode } from "..";
 import {
   Accordion,
   AccordionContent,
@@ -13,7 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ProxyLocation } from "@/api/types";
 import { Label } from "@/components/ui/label";
 import { HelpTooltip } from "@/components/HelpTooltip";
@@ -42,6 +51,7 @@ import { useUpdate } from "@/routes/workflows/editor/useUpdate";
 import { cn } from "@/util/utils";
 import { Button } from "@/components/ui/button";
 import { TestWebhookDialog } from "@/components/TestWebhookDialog";
+import { getWorkflowBlocks } from "../../workflowEditorUtils";
 
 interface StartSettings {
   webhookCallbackUrl: string;
@@ -50,11 +60,14 @@ interface StartSettings {
   model: WorkflowModel | null;
   maxScreenshotScrollingTimes: number | null;
   extraHttpHeaders: string | Record<string, unknown> | null;
+  finallyBlockLabel: string | null;
 }
 
 function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const workflowSettingsStore = useWorkflowSettingsStore();
   const reactFlowInstance = useReactFlow();
+  const nodes = useNodes<AppNode>();
+  const edges = useEdges();
   const [facing, setFacing] = useState<"front" | "back">("front");
   const blockScriptStore = useBlockScriptStore();
   const recordingStore = useRecordingStore();
@@ -63,9 +76,48 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
   const toggleScriptForNodeCallback = useToggleScriptForNodeCallback();
   const isRecording = recordingStore.isRecording;
 
+  // Local state for webhook URL to fix race condition where data.webhookCallbackUrl
+  // isn't updated yet when user clicks "Test Webhook" after typing
+  const webhookCallbackUrl = data.withWorkflowSettings
+    ? data.webhookCallbackUrl
+    : "";
+  const [localWebhookUrl, setLocalWebhookUrl] = useState(webhookCallbackUrl);
+  const prevWebhookUrl = useRef(webhookCallbackUrl);
+
+  // Sync from parent only on external changes (e.g., undo/redo), not our own updates
+  useEffect(() => {
+    if (!data.withWorkflowSettings) {
+      setLocalWebhookUrl("");
+      return;
+    }
+
+    const parentChanged = webhookCallbackUrl !== prevWebhookUrl.current;
+    const isExternalChange =
+      parentChanged && localWebhookUrl === prevWebhookUrl.current;
+
+    if (isExternalChange) {
+      setLocalWebhookUrl(webhookCallbackUrl);
+    }
+    prevWebhookUrl.current = webhookCallbackUrl;
+  }, [data.withWorkflowSettings, webhookCallbackUrl, localWebhookUrl]);
+
   const parentNode = parentId ? reactFlowInstance.getNode(parentId) : null;
   const isInsideConditional = parentNode?.type === "conditional";
   const isInsideLoop = parentNode?.type === "loop";
+  const withWorkflowSettings = data.withWorkflowSettings;
+  const finallyBlockLabel = withWorkflowSettings
+    ? data.finallyBlockLabel
+    : null;
+
+  // Only allow terminal blocks (next_block_label === null) for the finally block dropdown.
+  const terminalBlockLabels = useMemo(() => {
+    return getWorkflowBlocks(nodes, edges)
+      .filter((block) => (block.next_block_label ?? null) === null)
+      .map((block) => block.label);
+  }, [nodes, edges]);
+  const terminalBlockLabelSet = useMemo(() => {
+    return new Set(terminalBlockLabels);
+  }, [terminalBlockLabels]);
 
   const makeStartSettings = (data: StartNode["data"]): StartSettings => {
     return {
@@ -85,6 +137,9 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
       extraHttpHeaders: data.withWorkflowSettings
         ? data.extraHttpHeaders
         : null,
+      finallyBlockLabel: data.withWorkflowSettings
+        ? data.finallyBlockLabel
+        : null,
     };
   };
 
@@ -98,6 +153,16 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
     workflowSettingsStore.setWorkflowSettings(makeStartSettings(data));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
+
+  useEffect(() => {
+    if (
+      withWorkflowSettings &&
+      finallyBlockLabel &&
+      !terminalBlockLabelSet.has(finallyBlockLabel)
+    ) {
+      update({ finallyBlockLabel: null });
+    }
+  }, [finallyBlockLabel, withWorkflowSettings, terminalBlockLabelSet, update]);
 
   function nodeIsFlippable(node: Node) {
     return (
@@ -182,9 +247,10 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                         <div className="flex flex-col gap-2">
                           <Input
                             className="w-full"
-                            value={data.webhookCallbackUrl}
+                            value={localWebhookUrl}
                             placeholder="https://"
                             onChange={(event) => {
+                              setLocalWebhookUrl(event.target.value);
                               update({
                                 webhookCallbackUrl: event.target.value,
                               });
@@ -193,15 +259,14 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                           <TestWebhookDialog
                             runType="workflow_run"
                             runId={null}
-                            initialWebhookUrl={
-                              data.webhookCallbackUrl || undefined
-                            }
+                            initialWebhookUrl={localWebhookUrl || undefined}
+                            autoRunOnOpen={false}
                             trigger={
                               <Button
                                 type="button"
                                 variant="secondary"
                                 className="self-start"
-                                disabled={!data.webhookCallbackUrl}
+                                disabled={!localWebhookUrl}
                               >
                                 Test Webhook
                               </Button>
@@ -380,6 +445,33 @@ function StartNode({ id, data, parentId }: NodeProps<StartNode>) {
                             update({ maxScreenshotScrolls: value });
                           }}
                         />
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <Label>Execute on Any Outcome</Label>
+                          <HelpTooltip content="Select a block that will always run after the workflow completes, whether it succeeds, fails, or terminates early. Useful for cleanup tasks like logging out." />
+                        </div>
+                        <Select
+                          value={data.finallyBlockLabel ?? "none"}
+                          onValueChange={(value) => {
+                            update({
+                              finallyBlockLabel:
+                                value === "none" ? null : value,
+                            });
+                          }}
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="None" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="none">None</SelectItem>
+                            {terminalBlockLabels.map((label) => (
+                              <SelectItem key={label} value={label}>
+                                {label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
                     </div>
                   </AccordionContent>

@@ -10,7 +10,11 @@ from skyvern.config import settings
 from skyvern.constants import GET_DOWNLOADED_FILES_TIMEOUT
 from skyvern.forge.sdk.artifact.storage.base import BaseStorage
 from skyvern.forge.sdk.schemas.files import FileInfo
-from skyvern.forge.sdk.schemas.persistent_browser_sessions import Extensions, PersistentBrowserSession
+from skyvern.forge.sdk.schemas.persistent_browser_sessions import (
+    Extensions,
+    PersistentBrowserSession,
+    PersistentBrowserType,
+)
 
 LOG = structlog.get_logger()
 
@@ -23,6 +27,11 @@ class BrowserSessionResponse(BaseModel):
         examples=["pbs_123456"],
     )
     organization_id: str = Field(description="ID of the organization that owns this session")
+    status: str | None = Field(
+        None,
+        description="Current status of the browser session",
+        examples=["created", "running", "completed", "failed", "timeout"],
+    )
     runnable_type: str | None = Field(
         None,
         description="Type of the current runnable associated with this session (workflow, task etc)",
@@ -49,6 +58,10 @@ class BrowserSessionResponse(BaseModel):
     extensions: list[Extensions] | None = Field(
         None,
         description="A list of extensions installed in the browser session.",
+    )
+    browser_type: PersistentBrowserType | None = Field(
+        default=None,
+        description="The type of browser used for the session.",
     )
     vnc_streaming_supported: bool = Field(False, description="Whether the browser session supports VNC streaming")
     download_path: str | None = Field(None, description="The path where the browser session downloads files")
@@ -109,13 +122,16 @@ class BrowserSessionResponse(BaseModel):
                 )
 
             # Sort downloaded files by modified_at in descending order (newest first)
-            downloaded_files.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
+            # Treat None as "oldest".
+            downloaded_files.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
             # Sort recordings by modified_at in descending order (newest first)
-            recordings.sort(key=lambda x: x.modified_at or datetime.min, reverse=True)
+            # Treat None as "oldest".
+            recordings.sort(key=lambda f: (f.modified_at is not None, f.modified_at), reverse=True)
 
         return cls(
             browser_session_id=browser_session.persistent_browser_session_id,
             organization_id=browser_session.organization_id,
+            status=browser_session.status,
             runnable_type=browser_session.runnable_type,
             runnable_id=browser_session.runnable_id,
             timeout=browser_session.timeout_minutes,
@@ -131,4 +147,5 @@ class BrowserSessionResponse(BaseModel):
             downloaded_files=downloaded_files,
             recordings=recordings,
             extensions=browser_session.extensions,
+            browser_type=browser_session.browser_type,
         )

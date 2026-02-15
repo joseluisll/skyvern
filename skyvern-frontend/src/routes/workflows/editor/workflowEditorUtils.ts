@@ -46,6 +46,7 @@ import {
   URLBlockYAML,
   FileUploadBlockYAML,
   HttpRequestBlockYAML,
+  PrintPageBlockYAML,
 } from "../types/workflowYamlTypes";
 import {
   EMAIL_BLOCK_SENDER,
@@ -105,6 +106,7 @@ import { actionNodeDefaultData, isActionNode } from "./nodes/ActionNode/types";
 import {
   isNavigationNode,
   navigationNodeDefaultData,
+  MAX_STEPS_DEFAULT,
 } from "./nodes/NavigationNode/types";
 import {
   extractionNodeDefaultData,
@@ -118,10 +120,17 @@ import {
   isPdfParserNode,
   pdfParserNodeDefaultData,
 } from "./nodes/PDFParserNode/types";
-import { taskv2NodeDefaultData } from "./nodes/Taskv2Node/types";
 import { urlNodeDefaultData } from "./nodes/URLNode/types";
 import { fileUploadNodeDefaultData } from "./nodes/FileUploadNode/types";
-import { httpRequestNodeDefaultData } from "./nodes/HttpRequestNode/types";
+import {
+  httpRequestNodeDefaultData,
+  isHttpRequestNode,
+} from "./nodes/HttpRequestNode/types";
+import {
+  validateUrl,
+  validateJson,
+} from "./nodes/HttpRequestNode/httpValidation";
+import { printPageNodeDefaultData } from "./nodes/PrintPageNode/types";
 
 export const NEW_NODE_LABEL_PREFIX = "block_";
 
@@ -253,9 +262,13 @@ function getNestingLevel(node: AppNode, nodes: Array<AppNode>): number {
   return level;
 }
 
+// Extra margin to add when a block is being debugged and shows the status row
+const TARGETTED_BLOCK_EXTRA_MARGIN = 48;
+
 function layout(
   nodes: Array<AppNode>,
   edges: Array<Edge>,
+  targettedBlockLabel?: string,
 ): { nodes: Array<AppNode>; edges: Array<Edge> } {
   const loopNodes = nodes.filter(
     (node) => node.type === "loop" && !node.hidden,
@@ -279,12 +292,18 @@ function layout(
       ...n,
       position: { x: 0, y: 0 },
     }));
+    // Check if this loop node is the targetted block (being debugged)
+    // If so, add extra margin to account for the status row that appears
+    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
+    const isTargetted =
+      targettedBlockLabel && nodeLabel === targettedBlockLabel;
+    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
         marginx: (loopNodeWidth - maxChildWidth) / 2,
-        marginy: 225,
+        marginy,
       },
       nodes,
     );
@@ -328,12 +347,18 @@ function layout(
       position: { x: 0, y: 0 },
     }));
 
+    // Check if this conditional node is the targetted block (being debugged)
+    // If so, add extra margin to account for the status row that appears
+    const nodeLabel = isWorkflowBlockNode(node) ? node.data.label : undefined;
+    const isTargetted =
+      targettedBlockLabel && nodeLabel === targettedBlockLabel;
+    const marginy = isTargetted ? 225 + TARGETTED_BLOCK_EXTRA_MARGIN : 225;
     const layouted = layoutUtil(
       childNodesWithResetPositions,
       childEdges,
       {
         marginx: (conditionalNodeWidth - maxChildWidth) / 2,
-        marginy: 225,
+        marginy,
       },
       nodes,
     );
@@ -502,19 +527,33 @@ function convertToNode(
       };
     }
     case "task_v2": {
+      // Convert task_v2 blocks to navigation nodes with engine=SkyvernV2
       return {
         ...identifiers,
         ...common,
-        type: "taskv2",
+        type: "navigation",
         data: {
           ...commonData,
+          // V2-specific fields
           prompt: block.prompt,
           url: block.url ?? "",
-          maxSteps: block.max_steps,
+          maxSteps: block.max_steps ?? MAX_STEPS_DEFAULT,
           disableCache: block.disable_cache ?? false,
           totpIdentifier: block.totp_identifier,
           totpVerificationUrl: block.totp_verification_url,
-          maxScreenshotScrolls: null,
+          // Set engine to SkyvernV2 to indicate V2 mode
+          engine: RunEngine.SkyvernV2,
+          // Default V1 fields (not used in V2 mode but needed for type compatibility)
+          navigationGoal: "",
+          errorCodeMapping: "null",
+          completeCriterion: "",
+          terminateCriterion: "",
+          maxRetries: null,
+          maxStepsOverride: null,
+          allowDownloads: false,
+          downloadSuffix: null,
+          parameterKeys: [],
+          includeActionHistoryInVerification: false,
         },
       };
     }
@@ -555,6 +594,7 @@ function convertToNode(
       };
     }
     case "navigation": {
+      const isV2Engine = block.engine === RunEngine.SkyvernV2;
       return {
         ...identifiers,
         ...common,
@@ -577,6 +617,11 @@ function convertToNode(
           engine: block.engine ?? RunEngine.SkyvernV1,
           includeActionHistoryInVerification:
             block.include_action_history_in_verification ?? false,
+          // When engine is SkyvernV2, use navigation_goal as the prompt
+          prompt: isV2Engine ? block.navigation_goal ?? "" : "",
+          maxSteps: isV2Engine
+            ? block.max_steps_per_run ?? MAX_STEPS_DEFAULT
+            : MAX_STEPS_DEFAULT,
         },
       };
     }
@@ -833,6 +878,24 @@ function convertToNode(
           files: JSON.stringify(block.files || {}, null, 2),
           timeout: block.timeout,
           followRedirects: block.follow_redirects,
+          parameterKeys: block.parameters.map((p) => p.key),
+          downloadFilename: block.download_filename ?? "",
+          saveResponseAsFile: block.save_response_as_file ?? false,
+        },
+      };
+    }
+    case "print_page": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "printPage",
+        data: {
+          ...commonData,
+          includeTimestamp: block.include_timestamp ?? false,
+          customFilename: block.custom_filename ?? "",
+          format: block.format ?? "A4",
+          landscape: block.landscape ?? false,
+          printBackground: block.print_background ?? true,
           parameterKeys: block.parameters.map((p) => p.key),
         },
       };
@@ -1371,6 +1434,7 @@ function getElements(
       showCode: false,
       runSequentially: settings.runSequentially,
       sequentialKey: settings.sequentialKey,
+      finallyBlockLabel: settings.finallyBlockLabel ?? null,
     }),
   );
 
@@ -1655,13 +1719,15 @@ function createNode(
       };
     }
     case "taskv2": {
+      // Redirect taskv2 creation to navigation with SkyvernV2 engine
       return {
         ...identifiers,
         ...common,
-        type: "taskv2",
+        type: "navigation",
         data: {
-          ...taskv2NodeDefaultData,
+          ...navigationNodeDefaultData,
           label,
+          engine: RunEngine.SkyvernV2,
         },
       };
     }
@@ -1870,6 +1936,17 @@ function createNode(
         type: "http_request",
         data: {
           ...httpRequestNodeDefaultData,
+          label,
+        },
+      };
+    }
+    case "printPage": {
+      return {
+        ...identifiers,
+        ...common,
+        type: "printPage",
+        data: {
+          ...printPageNodeDefaultData,
           label,
         },
       };
@@ -2109,6 +2186,20 @@ function getWorkflowBlock(
       };
     }
     case "navigation": {
+      // If engine is SkyvernV2, convert to task_v2 block
+      if (node.data.engine === RunEngine.SkyvernV2) {
+        return {
+          ...base,
+          block_type: "task_v2",
+          prompt: node.data.prompt,
+          max_steps: node.data.maxSteps,
+          totp_identifier: node.data.totpIdentifier,
+          totp_verification_url: node.data.totpVerificationUrl,
+          url: node.data.url,
+          disable_cache: node.data.disableCache ?? false,
+        };
+      }
+      // Otherwise, create a navigation block
       return {
         ...base,
         block_type: "navigation",
@@ -2325,6 +2416,20 @@ function getWorkflowBlock(
         timeout: node.data.timeout,
         follow_redirects: node.data.followRedirects,
         parameter_keys: node.data.parameterKeys,
+        download_filename: node.data.downloadFilename || null,
+        save_response_as_file: node.data.saveResponseAsFile,
+      };
+    }
+    case "printPage": {
+      return {
+        ...base,
+        block_type: "print_page",
+        include_timestamp: node.data.includeTimestamp,
+        custom_filename: node.data.customFilename || null,
+        format: node.data.format,
+        landscape: node.data.landscape,
+        print_background: node.data.printBackground,
+        parameter_keys: node.data.parameterKeys,
       };
     }
     case "conditional": {
@@ -2398,11 +2503,14 @@ function getOrderedChildrenBlocks(
         edges,
         currentNode.id,
       );
+      // Compute next_block_label for nested loops (same as regular blocks)
+      const nextBlockLabel = findNextBlockLabel(currentNode.id, nodes, edges);
       children.push({
         block_type: "for_loop",
         label: currentNode.data.label,
         continue_on_failure: currentNode.data.continueOnFailure,
         next_loop_on_failure: currentNode.data.nextLoopOnFailure,
+        next_block_label: nextBlockLabel,
         loop_blocks: loopChildren,
         loop_variable_reference: currentNode.data.loopVariableReference,
         complete_if_empty: currentNode.data.completeIfEmpty,
@@ -2534,6 +2642,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
     aiFallback: true,
     runSequentially: false,
     sequentialKey: null,
+    finallyBlockLabel: null,
   };
   const startNodes = nodes.filter(isStartNode);
   const startNodeWithWorkflowSettings = startNodes.find(
@@ -2559,6 +2668,7 @@ function getWorkflowSettings(nodes: Array<AppNode>): WorkflowSettings {
       aiFallback: data.aiFallback,
       runSequentially: data.runSequentially,
       sequentialKey: data.sequentialKey,
+      finallyBlockLabel: data.finallyBlockLabel ?? null,
     };
   }
   return defaultSettings;
@@ -2607,6 +2717,382 @@ function getBlockNameOfOutputParameterKey(value: string) {
   return value;
 }
 
+/**
+ * Replaces jinja-style references in a string.
+ * Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}
+ * @param text - The text to search in
+ * @param oldKey - The key to replace (without braces)
+ * @param newKey - The new key to use (without braces)
+ * @returns The text with references replaced
+ */
+function replaceJinjaReference(
+  text: string,
+  oldKey: string,
+  newKey: string,
+): string {
+  // Match {{oldKey}} or {{oldKey.something}} or {{oldKey | filter}} or {{oldKey[0]}} etc.
+  // Use negative lookahead to ensure key is not followed by identifier characters,
+  // which prevents matching {{keyOther}} when searching for {{key}}
+  // Capture whitespace after {{ to preserve formatting (e.g., "{{ key }}" stays "{{ newKey }}")
+  const regex = new RegExp(
+    `\\{\\{(\\s*)${escapeRegExp(oldKey)}(?![a-zA-Z0-9_])`,
+    "g",
+  );
+  return text.replace(regex, (_, whitespace) => `{{${whitespace}${newKey}`);
+}
+
+/**
+ * Removes jinja-style references from a string.
+ * Handles patterns like {{key}}, {{key.field}}, {{key | filter}}
+ * @param text - The text to search in
+ * @param key - The key to remove (without braces)
+ * @returns The text with references removed
+ */
+function removeJinjaReference(text: string, key: string): string {
+  // Match the entire {{key...}} pattern including any suffixes
+  // Use negative lookahead to ensure key is not followed by identifier characters
+  // (prevents matching {{user_id}} when removing {{user}})
+  // Limit to 500 chars inside braces to prevent potential ReDoS with malicious input
+  const regex = new RegExp(
+    `\\{\\{\\s*${escapeRegExp(key)}(?![a-zA-Z0-9_])[^}]{0,500}\\}\\}`,
+    "g",
+  );
+  return text.replace(regex, "").trim();
+}
+
+/**
+ * Escapes special regex characters in a string
+ */
+function escapeRegExp(string: string): string {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Checks if a string contains a jinja reference to a specific key
+ * @param text - The text to search in
+ * @param key - The key to look for (without braces)
+ * @returns True if the text contains a reference to the key
+ */
+function containsJinjaReference(text: string, key: string): boolean {
+  // Use negative lookahead to ensure key is not followed by identifier characters
+  const regex = new RegExp(`\\{\\{\\s*${escapeRegExp(key)}(?![a-zA-Z0-9_])`);
+  return regex.test(text);
+}
+
+/**
+ * Recursively checks if any string field in an object contains a jinja reference to a key.
+ * @param obj - The object to check
+ * @param key - The key to look for
+ * @param skipKeys - Set of keys to skip
+ * @param depth - Current recursion depth
+ * @returns True if any string field contains a jinja reference to the key
+ */
+function objectContainsJinjaReference(
+  obj: unknown,
+  key: string,
+  skipKeys: Set<string>,
+  depth: number = 0,
+): boolean {
+  const MAX_DEPTH = 50;
+  if (depth > MAX_DEPTH || obj === null || obj === undefined) {
+    return false;
+  }
+
+  if (typeof obj === "string") {
+    return containsJinjaReference(obj, key);
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.some((item) =>
+      objectContainsJinjaReference(item, key, skipKeys, depth + 1),
+    );
+  }
+
+  if (typeof obj === "object") {
+    for (const [objKey, value] of Object.entries(obj)) {
+      if (skipKeys.has(objKey)) {
+        continue;
+      }
+      if (objectContainsJinjaReference(value, key, skipKeys, depth + 1)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+// Keys to skip when checking for jinja references (same as transform)
+const SKIP_KEYS_FOR_JINJA_CHECK = new Set([
+  "label",
+  "key",
+  "type",
+  "id",
+  "nodeId",
+  "parameterKeys",
+]);
+
+/**
+ * Information about a block that references a parameter or block output.
+ */
+type AffectedBlock = {
+  nodeId: string;
+  label: string;
+  hasParameterKeyReference: boolean;
+  hasJinjaReference: boolean;
+};
+
+/**
+ * Finds all blocks that reference a given key (parameter or block output).
+ * Checks both parameterKeys arrays and jinja references in text fields.
+ * @param nodes - Array of workflow nodes
+ * @param key - The key to search for (e.g., "my_param" or "block_1_output")
+ * @returns Array of affected block information
+ */
+function getAffectedBlocks<T extends Node>(
+  nodes: T[],
+  key: string,
+): AffectedBlock[] {
+  const affectedBlocks: AffectedBlock[] = [];
+
+  for (const node of nodes) {
+    // Skip non-block nodes (start, nodeAdder, etc.)
+    if (
+      !node.data ||
+      !("label" in node.data) ||
+      node.type === "start" ||
+      node.type === "nodeAdder"
+    ) {
+      continue;
+    }
+
+    const label = node.data.label as string;
+    let hasParameterKeyReference = false;
+    let hasJinjaReference = false;
+
+    // Check parameterKeys array
+    const parameterKeys = node.data.parameterKeys as Array<string> | undefined;
+    if (parameterKeys?.includes(key)) {
+      hasParameterKeyReference = true;
+    }
+
+    // Check for loop node's loopVariableReference
+    if (node.type === "loop") {
+      const loopVarRef = node.data.loopVariableReference as string | undefined;
+      if (loopVarRef === key || containsJinjaReference(loopVarRef ?? "", key)) {
+        hasJinjaReference = true;
+      }
+    }
+
+    // Check jinja references in text fields
+    if (
+      objectContainsJinjaReference(node.data, key, SKIP_KEYS_FOR_JINJA_CHECK)
+    ) {
+      hasJinjaReference = true;
+    }
+
+    if (hasParameterKeyReference || hasJinjaReference) {
+      affectedBlocks.push({
+        nodeId: node.id,
+        label,
+        hasParameterKeyReference,
+        hasJinjaReference,
+      });
+    }
+  }
+
+  return affectedBlocks;
+}
+
+// Maximum recursion depth to prevent stack overflow from malicious deeply nested objects
+const MAX_TRANSFORM_DEPTH = 50;
+
+/**
+ * Recursively processes all string fields in an object and applies a transformation function.
+ * @param obj - The object to process
+ * @param transform - Function that transforms string values
+ * @param skipKeys - Set of keys to skip (e.g., 'label' which shouldn't be modified)
+ * @param depth - Current recursion depth (internal use)
+ * @returns A new object with transformed string values
+ */
+function transformStringFieldsInObject<T>(
+  obj: T,
+  transform: (value: string) => string,
+  skipKeys: Set<string>,
+  depth: number = 0,
+): T {
+  // Prevent stack overflow from deeply nested objects
+  if (depth > MAX_TRANSFORM_DEPTH) {
+    return obj;
+  }
+
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+
+  if (typeof obj === "string") {
+    return transform(obj) as T;
+  }
+
+  if (Array.isArray(obj)) {
+    return obj.map((item) =>
+      transformStringFieldsInObject(item, transform, skipKeys, depth + 1),
+    ) as T;
+  }
+
+  if (typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (skipKeys.has(key)) {
+        result[key] = value;
+      } else {
+        result[key] = transformStringFieldsInObject(
+          value,
+          transform,
+          skipKeys,
+          depth + 1,
+        );
+      }
+    }
+    return result as T;
+  }
+
+  return obj;
+}
+
+// Keys to skip when transforming string fields in node data
+const SKIP_KEYS_FOR_JINJA_TRANSFORM = new Set([
+  "label",
+  "key",
+  "type",
+  "id",
+  "nodeId",
+  "parameterKeys", // handled separately
+]);
+
+/**
+ * Replaces all jinja-style references to a variable across all nodes.
+ * Handles patterns like {{oldKey}}, {{oldKey.field}}, {{oldKey | filter}}.
+ * Returns a new array of nodes with updated data (immutable).
+ *
+ * Note: This only handles inline {{ variable }} references in string fields.
+ * The parameterKeys array should be updated separately.
+ */
+function replaceJinjaReferenceInNodes<T extends Node>(
+  nodes: T[],
+  oldKey: string,
+  newKey: string,
+): T[] {
+  return nodes.map((node) => {
+    if (!node.data) {
+      return node;
+    }
+    return {
+      ...node,
+      data: transformStringFieldsInObject(
+        node.data,
+        (text) => replaceJinjaReference(text, oldKey, newKey),
+        SKIP_KEYS_FOR_JINJA_TRANSFORM,
+      ),
+    };
+  });
+}
+
+/**
+ * Removes all jinja-style references to a variable across all nodes.
+ * Handles patterns like {{key}}, {{key.field}}, {{key | filter}}.
+ * Returns a new array of nodes with updated data (immutable).
+ *
+ * Note: This only handles inline {{ variable }} references in string fields.
+ * The parameterKeys array should be updated separately.
+ */
+function removeJinjaReferenceFromNodes<T extends Node>(
+  nodes: T[],
+  key: string,
+): T[] {
+  return nodes.map((node) => {
+    if (!node.data) {
+      return node;
+    }
+    return {
+      ...node,
+      data: transformStringFieldsInObject(
+        node.data,
+        (text) => removeJinjaReference(text, key),
+        SKIP_KEYS_FOR_JINJA_TRANSFORM,
+      ),
+    };
+  });
+}
+
+/**
+ * Removes a key from all nodes' parameterKeys arrays and handles special cases.
+ * Used when deleting a block output or parameter.
+ *
+ * @param nodes - Array of nodes to process
+ * @param keyToRemove - The key to remove from parameterKeys arrays
+ * @param deletedBlockLabel - Optional label of deleted block (for finallyBlockLabel cleanup)
+ * @returns New array of nodes with the key removed
+ */
+function removeKeyFromNodesParameterKeys<T extends Node>(
+  nodes: T[],
+  keyToRemove: string,
+  deletedBlockLabel?: string,
+): T[] {
+  return nodes.map((node) => {
+    if (!node.data) {
+      return node;
+    }
+
+    // Handle start node's finallyBlockLabel
+    if (
+      node.type === "start" &&
+      deletedBlockLabel &&
+      (node.data as Record<string, unknown>).withWorkflowSettings &&
+      (node.data as Record<string, unknown>).finallyBlockLabel ===
+        deletedBlockLabel
+    ) {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          finallyBlockLabel: null,
+        },
+      } as T;
+    }
+
+    // Handle loop node's loopVariableReference
+    if (node.type === "loop") {
+      const loopData = node.data as Record<string, unknown>;
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          loopVariableReference:
+            loopData.loopVariableReference === keyToRemove
+              ? ""
+              : loopData.loopVariableReference,
+        },
+      } as T;
+    }
+
+    // Handle parameterKeys for all other node types
+    const parameterKeys = (node.data as Record<string, unknown>)
+      .parameterKeys as Array<string> | null | undefined;
+    if (parameterKeys !== undefined) {
+      return {
+        ...node,
+        data: {
+          ...node.data,
+          parameterKeys: parameterKeys?.filter((key) => key !== keyToRemove),
+        },
+      } as T;
+    }
+
+    return node;
+  });
+}
+
 function getUpdatedNodesAfterLabelUpdateForParameterKeys(
   id: string,
   newLabel: string,
@@ -2617,42 +3103,64 @@ function getUpdatedNodesAfterLabelUpdateForParameterKeys(
     return nodes;
   }
   const oldLabel = labelUpdatedNode.data.label as string;
-  return nodes.map((node) => {
+  const oldOutputKey = getOutputParameterKey(oldLabel);
+  const newOutputKey = getOutputParameterKey(newLabel);
+
+  // Step 1: Update inline {{ old_output }} references to {{ new_output }}
+  const nodesWithUpdatedRefs = replaceJinjaReferenceInNodes(
+    nodes,
+    oldOutputKey,
+    newOutputKey,
+  );
+
+  // Step 2: Update parameterKeys arrays and the label of the renamed node
+  return nodesWithUpdatedRefs.map((node) => {
     if (node.type === "nodeAdder" || node.type === "start") {
+      // Update label if this is the node being renamed
+      if (node.id === id) {
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            label: newLabel,
+          },
+        };
+      }
       return node;
     }
-    if (node.type === "task" || node.type === "textPrompt") {
-      return {
-        ...node,
-        data: {
-          ...node.data,
-          parameterKeys: (node.data.parameterKeys as Array<string>).map(
-            (key) =>
-              key === getOutputParameterKey(oldLabel)
-                ? getOutputParameterKey(newLabel)
-                : key,
-          ),
-          label: node.id === id ? newLabel : node.data.label,
-        },
-      };
-    }
+
+    // Handle loop node's loopVariableReference (the active field displayed in UI).
+    // Note: loopValue is a legacy field populated during conversion for backward compatibility.
+    // It's not displayed in UI or sent to backend, so we only update loopVariableReference.
     if (node.type === "loop") {
       return {
         ...node,
         data: {
           ...node.data,
-          label: node.id === id ? newLabel : node.data.label,
           loopVariableReference:
-            node.data.loopVariableReference === getOutputParameterKey(oldLabel)
-              ? getOutputParameterKey(newLabel)
+            node.data.loopVariableReference === oldOutputKey
+              ? newOutputKey
               : node.data.loopVariableReference,
+          label: node.id === id ? newLabel : node.data.label,
         },
       };
     }
+
+    // Handle parameterKeys (it's an array of key names, not jinja text)
+    const parameterKeys = node.data.parameterKeys as Array<string> | null;
+    const updatedParameterKeys = parameterKeys?.map((key) =>
+      key === oldOutputKey ? newOutputKey : key,
+    );
+
     return {
       ...node,
       data: {
         ...node.data,
+        // Update parameterKeys if present
+        ...(parameterKeys !== undefined && {
+          parameterKeys: updatedParameterKeys,
+        }),
+        // Update the label for the node being renamed
         label: node.id === id ? newLabel : node.data.label,
       },
     };
@@ -3324,6 +3832,20 @@ function convertBlocksToBlockYAML(
           timeout: block.timeout,
           follow_redirects: block.follow_redirects,
           parameter_keys: block.parameters.map((p) => p.key),
+          download_filename: block.download_filename,
+        };
+        return blockYaml;
+      }
+      case "print_page": {
+        const blockYaml: PrintPageBlockYAML = {
+          ...base,
+          block_type: "print_page",
+          include_timestamp: block.include_timestamp,
+          custom_filename: block.custom_filename,
+          format: block.format,
+          landscape: block.landscape,
+          print_background: block.print_background,
+          parameter_keys: block.parameters.map((p) => p.key),
         };
         return blockYaml;
       }
@@ -3350,6 +3872,7 @@ function convert(workflow: WorkflowApiResponse): WorkflowCreateYAMLRequest {
       version: workflowDefinitionVersion,
       parameters: convertParametersToParameterYAML(userParameters),
       blocks: convertBlocksToBlockYAML(workflow.workflow_definition.blocks),
+      finally_block_label: workflow.workflow_definition.finally_block_label,
     },
     is_saved_task: workflow.is_saved_task,
     status: workflow.status,
@@ -3444,8 +3967,15 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
 
   const navigationNodes = nodes.filter(isNavigationNode);
   navigationNodes.forEach((node) => {
-    if (node.data.navigationGoal.length === 0) {
-      errors.push(`${node.data.label}: Navigation goal is required.`);
+    // V2 mode uses prompt, V1 mode uses navigationGoal
+    if (node.data.engine === RunEngine.SkyvernV2) {
+      if (!node.data.prompt || node.data.prompt.length === 0) {
+        errors.push(`${node.data.label}: Prompt is required.`);
+      }
+    } else {
+      if (!node.data.navigationGoal || node.data.navigationGoal.length === 0) {
+        errors.push(`${node.data.label}: Prompt is required.`);
+      }
     }
   });
 
@@ -3521,6 +4051,28 @@ function getWorkflowErrors(nodes: Array<AppNode>): Array<string> {
     }
   });
 
+  const httpRequestNodes = nodes.filter(isHttpRequestNode);
+  httpRequestNodes.forEach((node) => {
+    // Validate URL - required and must be valid format
+    const urlValidation = validateUrl(node.data.url);
+    if (!urlValidation.valid) {
+      errors.push(`${node.data.label}: ${urlValidation.message}`);
+    }
+
+    // Validate JSON fields - optional but must be valid if provided
+    const jsonFields = [
+      { value: node.data.headers, name: "Headers" },
+      { value: node.data.body, name: "Body" },
+      { value: node.data.files, name: "Files" },
+    ];
+    jsonFields.forEach(({ value, name }) => {
+      const result = validateJson(value);
+      if (!result.valid && result.message) {
+        errors.push(`${node.data.label}: ${name} is not valid JSON.`);
+      }
+    });
+  });
+
   return errors;
 }
 
@@ -3567,12 +4119,14 @@ function isNodeInsideForLoop(nodes: Array<AppNode>, nodeId: string): boolean {
 }
 
 export {
+  containsJinjaReference,
   convert,
   convertEchoParameters,
   convertToNode,
   createNode,
   generateNodeData,
   generateNodeLabel,
+  getAffectedBlocks,
   getNestingLevel,
   getAdditionalParametersForEmailBlock,
   getAvailableOutputParameterKeys,
@@ -3593,4 +4147,9 @@ export {
   isNodeInsideForLoop,
   isOutputParameterKey,
   layout,
+  removeJinjaReferenceFromNodes,
+  removeKeyFromNodesParameterKeys,
+  replaceJinjaReferenceInNodes,
 };
+
+export type { AffectedBlock };

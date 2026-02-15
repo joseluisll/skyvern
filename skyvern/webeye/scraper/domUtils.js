@@ -1683,6 +1683,7 @@ async function buildElementObject(
 async function buildTreeFromBody(
   frame = "main.frame",
   frame_index = undefined,
+  must_included_tags = [],
 ) {
   if (
     window.GlobalSkyvernFrameIndex === undefined &&
@@ -1697,6 +1698,7 @@ async function buildTreeFromBody(
     false,
     undefined,
     maxElementNumber,
+    must_included_tags,
   );
   DomUtils.elementListCache = elementsAndResultArray[0];
   return elementsAndResultArray;
@@ -1708,12 +1710,19 @@ async function buildElementTree(
   full_tree = false,
   hoverStylesMap = undefined,
   maxElementNumber = 0,
+  must_included_tags = [],
 ) {
   // Generate hover styles map at the start
   if (hoverStylesMap === undefined) {
     hoverStylesMap = await getHoverStylesMap();
   }
 
+  if (must_included_tags.length > 0) {
+    _jsConsoleLog(
+      "full tree will be enabled as the must_included_tags is not empty",
+    );
+    full_tree = true;
+  }
   if (window.GlobalEnableAllTextualElements === undefined) {
     window.GlobalEnableAllTextualElements = false;
   }
@@ -1834,6 +1843,10 @@ async function buildElementTree(
         );
         if (elementObj.text.length > 0) {
           elementObj.purgeable = false;
+        }
+        if (must_included_tags.includes(tagName)) {
+          elementObj.purgeable = false;
+          elementObj.interactable = true;
         }
       }
 
@@ -2310,6 +2323,56 @@ function isWindowScrollable() {
     return false;
   }
 
+  return true;
+}
+
+/**
+ * Find the nearest scrollable container relative to the given element and scroll it.
+ * Two strategies:
+ *   1) Walk up from element to find a scrollable ancestor (element is inside container)
+ *   2) Walk up the DOM checking siblings at each level (element is beside container)
+ * Returns true if a scrollable container was found and scrolled, false otherwise.
+ */
+function scrollNearestScrollableContainer(element, direction) {
+  function isContainerScrollable(node) {
+    if (!node || node === document.documentElement || node === document.body)
+      return false;
+    const style = window.getComputedStyle(node);
+    const oy = style.overflowY;
+    return (
+      (oy === "auto" || oy === "scroll") &&
+      node.scrollHeight > node.clientHeight
+    );
+  }
+
+  // Strategy 1: walk up from element to find a scrollable ancestor
+  let target = element;
+  while (target && target !== document.documentElement) {
+    if (isContainerScrollable(target)) break;
+    target = target.parentElement;
+  }
+
+  // Strategy 2: walk up the DOM checking siblings at each level
+  if (!target || target === document.documentElement) {
+    target = null;
+    let level = element.parentElement;
+    while (level && level !== document.documentElement && !target) {
+      for (const child of level.children) {
+        if (isContainerScrollable(child)) {
+          target = child;
+          break;
+        }
+      }
+      level = level.parentElement;
+    }
+  }
+
+  if (!target) return false;
+  if (direction === "down") {
+    target.scrollTop = target.scrollHeight;
+  } else {
+    target.scrollTop = 0;
+  }
   return true;
 }
 

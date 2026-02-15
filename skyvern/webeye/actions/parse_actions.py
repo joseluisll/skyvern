@@ -6,7 +6,7 @@ import structlog
 from openai.types.responses.response import Response as OpenAIResponse
 from pydantic import ValidationError
 
-from skyvern.constants import SCROLL_AMOUNT_MULTIPLIER
+from skyvern.constants import EXTRACT_ACTION_SCROLL_AMOUNT, SCROLL_AMOUNT_MULTIPLIER
 from skyvern.exceptions import FailedToGetTOTPVerificationCode, NoTOTPVerificationCodeFound, UnsupportedActionType
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -19,6 +19,7 @@ from skyvern.utils.image_resizer import Resolution, scale_coordinates
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
     Action,
+    CaptchaType,
     CheckboxAction,
     ClickAction,
     ClickContext,
@@ -86,12 +87,16 @@ def parse_action(
         return NullAction(**base_action_dict)
 
     # `.upper()` handles the case where the LLM returns a lowercase action type (e.g. "click" instead of "CLICK")
-    action_type = ActionType[action["action_type"].upper()]
+    action_type_str = action["action_type"].upper()
+    # Backward compat: map PRESS_ENTER to KEYPRESS (old prompt used PRESS_ENTER)
+    if action_type_str == "PRESS_ENTER":
+        action_type_str = "KEYPRESS"
+    action_type = ActionType[action_type_str]
 
-    if not action_type.is_web_action():
+    if not action_type.is_web_action() and action_type != ActionType.SCROLL:
         # LLM sometimes hallucinates and returns element id for non-web actions such as WAIT, TERMINATE, COMPLETE etc.
         # That can sometimes cause cached action plan to be invalidated. This way we're making sure the element id is not
-        # set for non-web actions.
+        # set for non-web actions. SCROLL needs element_id to target a specific scrollable container.
         base_action_dict["element_id"] = None
 
     if action_type == ActionType.TERMINATE:
@@ -181,7 +186,44 @@ def parse_action(
         return NullAction(**base_action_dict)
 
     if action_type == ActionType.SOLVE_CAPTCHA:
-        return SolveCaptchaAction(**base_action_dict)
+        captcha_type: str | None = action.get("captcha_type")
+        return SolveCaptchaAction(
+            **base_action_dict, captcha_type=CaptchaType[captcha_type.upper()] if captcha_type else None
+        )
+
+    if action_type == ActionType.KEYPRESS:
+        # KEYPRESS is a global keyboard action, not element-targeted
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        # Support both "key" (single key from prompt) and "keys" (list, from code/legacy)
+        # Limited to navigation/submission keys to prevent misuse on regular form fields
+        allowed_keys = {"Enter", "Tab", "Escape", "ArrowDown", "ArrowUp"}
+        key = action.get("key")
+        if key:
+            if key not in allowed_keys:
+                LOG.warning("KEYPRESS action has unsupported key, skipping action", key=key)
+                return NullAction(**base_action_dict)
+            keys = [key]
+        else:
+            keys = action.get("keys", ["Enter"])
+        return KeypressAction(**base_action_dict, keys=keys)
+
+    if action_type == ActionType.SCROLL:
+        # SCROLL from extract-action prompt provides a direction and optionally an element_id
+        # for the scrollable container. Convert direction to scroll_x/scroll_y pixel values.
+        base_action_dict["skyvern_element_hash"] = None
+        base_action_dict["skyvern_element_data"] = None
+        direction = action.get("direction", "down").lower()
+        if direction not in ("up", "down"):
+            LOG.warning("SCROLL action has unexpected direction, defaulting to down", direction=direction)
+            direction = "down"
+        if direction == "up":
+            scroll_x = 0
+            scroll_y = -EXTRACT_ACTION_SCROLL_AMOUNT
+        else:
+            scroll_x = 0
+            scroll_y = EXTRACT_ACTION_SCROLL_AMOUNT
+        return ScrollAction(**base_action_dict, scroll_x=scroll_x, scroll_y=scroll_y)
 
     if action_type == ActionType.CLOSE_PAGE:
         return ClosePageAction(**base_action_dict)
@@ -366,12 +408,13 @@ async def parse_cua_actions(
                             intention=reasoning,
                         )
                     else:
-                        start_x, start_y = whole_path[0][0], whole_path[0][1]
+                        # ActionDragPath objects have x and y attributes
+                        start_x, start_y = whole_path[0].x, whole_path[0].y
                         reasoning = reasoning or f"Drag action path: {whole_path}"
                         action = DragAction(
                             start_x=start_x,
                             start_y=start_y,
-                            path=whole_path[1:],
+                            path=[(p.x, p.y) for p in whole_path[1:]],
                             reasoning=reasoning,
                             intention=reasoning,
                         )

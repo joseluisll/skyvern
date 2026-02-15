@@ -57,6 +57,7 @@ class ProxyLocation(StrEnum):
     RESIDENTIAL_MX = "RESIDENTIAL_MX"
     RESIDENTIAL_IT = "RESIDENTIAL_IT"
     RESIDENTIAL_NL = "RESIDENTIAL_NL"
+    RESIDENTIAL_PH = "RESIDENTIAL_PH"
     RESIDENTIAL_ISP = "RESIDENTIAL_ISP"
     NONE = "NONE"
 
@@ -95,6 +96,7 @@ class ProxyLocation(StrEnum):
             cls.RESIDENTIAL_MX,
             cls.RESIDENTIAL_IT,
             cls.RESIDENTIAL_NL,
+            cls.RESIDENTIAL_PH,
         }
 
     @staticmethod
@@ -118,6 +120,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_MX: 2000,
             ProxyLocation.RESIDENTIAL_IT: 2000,
             ProxyLocation.RESIDENTIAL_NL: 2000,
+            ProxyLocation.RESIDENTIAL_PH: 2000,
         }
         return counts.get(proxy_location, 10000)
 
@@ -142,6 +145,7 @@ class ProxyLocation(StrEnum):
             ProxyLocation.RESIDENTIAL_MX: "MX",
             ProxyLocation.RESIDENTIAL_IT: "IT",
             ProxyLocation.RESIDENTIAL_NL: "NL",
+            ProxyLocation.RESIDENTIAL_PH: "PH",
         }
         return mapping.get(proxy_location, "US")
 
@@ -165,6 +169,7 @@ SUPPORTED_GEO_COUNTRIES = frozenset(
         "MX",
         "NL",
         "NZ",
+        "PH",
         "TR",
         "ZA",
     }
@@ -307,6 +312,9 @@ def get_tzinfo_from_proxy(proxy_location: ProxyLocation) -> ZoneInfo | None:
     if proxy_location == ProxyLocation.RESIDENTIAL_NL:
         return ZoneInfo("Europe/Amsterdam")
 
+    if proxy_location == ProxyLocation.RESIDENTIAL_PH:
+        return ZoneInfo("Asia/Manila")
+
     if proxy_location == ProxyLocation.RESIDENTIAL_ISP:
         return ZoneInfo("America/New_York")
 
@@ -428,6 +436,11 @@ class TaskRunRequest(BaseModel):
         default=None,
         description="The CDP address for the task.",
         examples=["http://127.0.0.1:9222", "ws://127.0.0.1:9222/devtools/browser/1234567890"],
+    )
+    run_with: str | None = Field(
+        default=None,
+        description="Whether to run the task with agent or code.",
+        examples=["agent", "code"],
     )
 
     @field_validator("url", "webhook_url", "totp_url")
@@ -598,6 +611,10 @@ class BaseRunResponse(BaseModel):
     errors: list[dict[str, Any]] | None = Field(
         default=None,
         description="The errors for the run",
+    )
+    step_count: int | None = Field(
+        default=None,
+        description="Total number of steps executed in this run",
     )
 
 

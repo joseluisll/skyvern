@@ -113,14 +113,6 @@ class ImaginaryFileUrl(SkyvernException):
         super().__init__(f"File url {file_url} is imaginary.")
 
 
-class DownloadedFileNotFound(SkyvernException):
-    def __init__(self, downloaded_path: str, download_url: str | None = None) -> None:
-        message = f"Downloaded file does not exist at path: {downloaded_path}. This may indicate the download failed silently or the file was removed."
-        if download_url:
-            message += f" Download URL: {download_url}"
-        super().__init__(message)
-
-
 class MissingBrowserState(SkyvernException):
     def __init__(self, task_id: str | None = None, workflow_run_id: str | None = None) -> None:
         task_str = f"task_id={task_id}" if task_id else ""
@@ -829,17 +821,20 @@ class BrowserSessionNotFound(SkyvernHTTPException):
         )
 
 
+class BrowserSessionStartupTimeout(SkyvernHTTPException):
+    def __init__(self, browser_session_id: str) -> None:
+        super().__init__(
+            f"Browser session {browser_session_id} failed to start within the timeout period.",
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        )
+
+
 class BrowserProfileNotFound(SkyvernHTTPException):
     def __init__(self, profile_id: str, organization_id: str | None = None) -> None:
         message = f"Browser profile {profile_id} not found"
         if organization_id:
             message += f" for organization {organization_id}"
         super().__init__(message, status_code=status.HTTP_404_NOT_FOUND)
-
-
-class CannotUpdateWorkflowDueToCodeCache(SkyvernException):
-    def __init__(self, workflow_permanent_id: str) -> None:
-        super().__init__(f"No confirmation for code cache deletion on {workflow_permanent_id}.")
 
 
 class APIKeyNotFound(SkyvernHTTPException):
@@ -867,9 +862,21 @@ class NoElementFound(SkyvernException):
         super().__init__("No element found.")
 
 
-class OutputParameterNotFound(SkyvernException):
+class OutputParameterNotFound(SkyvernHTTPException):
     def __init__(self, block_label: str, workflow_permanent_id: str) -> None:
-        super().__init__(f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}")
+        super().__init__(
+            f"Output parameter for {block_label} not found in workflow {workflow_permanent_id}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class TemporalSubmissionFailed(SkyvernHTTPException):
+    def __init__(self, workflow_type: str, workflow_run_id: str | None = None) -> None:
+        workflow_run_str = f" for workflow_run_id={workflow_run_id}" if workflow_run_id else ""
+        super().__init__(
+            f"Failed to submit {workflow_type} to Temporal{workflow_run_str}",
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 class AzureBaseError(SkyvernException):
@@ -922,4 +929,11 @@ class PDFParsingError(SkyvernException):
         self.pdfplumber_error = pdfplumber_error
         super().__init__(
             f"Failed to parse PDF '{file_identifier}'. pypdf error: {pypdf_error}; pdfplumber error: {pdfplumber_error}"
+        )
+
+
+class ImaginarySecretValue(SkyvernException):
+    def __init__(self, value: str) -> None:
+        super().__init__(
+            f"The value {value} is imaginary. Try to double-check to see if this value is included in the provided information"
         )

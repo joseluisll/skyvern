@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 import structlog
+from opentelemetry import trace as otel_trace
 from sqlalchemy.exc import OperationalError
 
 from skyvern.config import settings
@@ -26,7 +27,7 @@ from skyvern.forge.sdk.db.enums import OrganizationAuthTokenType
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2, TaskV2Metadata, TaskV2Status, ThoughtScenario, ThoughtType
 from skyvern.forge.sdk.schemas.workflow_runs import WorkflowRunTimeline, WorkflowRunTimelineType
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.models.block import (
     BlockTypeVar,
     ExtractionBlock,
@@ -146,6 +147,80 @@ async def _summarize_max_steps_failure_reason(
         return ""
 
 
+async def _handle_task_v2_termination(
+    task_v2_id: str,
+    organization_id: str,
+    workflow_run_id: str,
+    workflow_id: str,
+    workflow_permanent_id: str,
+    termination_reason: str | None,
+    iteration: int,
+    source: str | None = None,
+) -> TaskV2:
+    """
+    Handle task v2 termination by creating a termination thought and marking the task as terminated.
+
+    Args:
+        task_v2_id: The task v2 ID
+        organization_id: The organization ID
+        workflow_run_id: The workflow run ID
+        workflow_id: The workflow ID
+        workflow_permanent_id: The workflow permanent ID
+        termination_reason: The reason for termination (from LLM response)
+        iteration: The current iteration number
+        source: Optional source identifier (e.g., "completion_check")
+
+    Returns:
+        The updated TaskV2 object with terminated status
+    """
+    log_message = "Task v2 should terminate"
+    if source:
+        log_message = f"Task v2 should terminate according to {source}"
+    log_message += " - goal is impossible to achieve"
+
+    LOG.info(
+        log_message,
+        iteration=iteration,
+        workflow_run_id=workflow_run_id,
+        termination_reason=termination_reason,
+    )
+
+    # Create a dedicated termination thought for UI visibility
+    termination_thought = await app.DATABASE.create_thought(
+        task_v2_id=task_v2_id,
+        organization_id=organization_id,
+        workflow_run_id=workflow_run_id,
+        workflow_id=workflow_id,
+        workflow_permanent_id=workflow_permanent_id,
+        thought_type=ThoughtType.termination,
+        thought_scenario=ThoughtScenario.termination,
+        thought=termination_reason or "Task goal is impossible to achieve",
+    )
+
+    output: dict[str, Any] = {
+        "should_terminate": True,
+        "termination_reason": termination_reason,
+        "iteration": iteration,
+    }
+    if source:
+        output["source"] = source
+
+    await app.DATABASE.update_thought(
+        thought_id=termination_thought.observer_thought_id,
+        organization_id=organization_id,
+        output=output,
+    )
+
+    task_v2 = await mark_task_v2_as_terminated(
+        task_v2_id=task_v2_id,
+        workflow_run_id=workflow_run_id,
+        organization_id=organization_id,
+        failure_reason=termination_reason or "Task goal is impossible to achieve",
+    )
+
+    return task_v2
+
+
 async def initialize_task_v2(
     organization: Organization,
     user_prompt: str,
@@ -209,6 +284,7 @@ async def initialize_task_v2(
                 browser_session_id=browser_session_id,
                 extra_http_headers=extra_http_headers,
                 browser_address=browser_address,
+                run_with=run_with,
             ),
             workflow_permanent_id=new_workflow.workflow_permanent_id,
             organization=organization,
@@ -352,7 +428,7 @@ async def initialize_task_v2_metadata(
     return task_v2
 
 
-@TraceManager.traced_async(ignore_inputs=["organization"])
+@traced()
 async def run_task_v2(
     organization: Organization,
     task_v2_id: str,
@@ -525,6 +601,16 @@ async def run_task_v2_helper(
         current_run_id,
         properties={"organization_id": organization_id, "task_url": task_v2.url},
     )
+    enable_task_v2_termination = await app.EXPERIMENTATION_PROVIDER.is_feature_enabled_cached(
+        "ENABLE_TASK_V2_TERMINATION",
+        current_run_id,
+        properties={"organization_id": organization_id, "task_url": task_v2.url},
+    )
+    LOG.info(
+        "Task v2 termination feature flag",
+        enable_task_v2_termination=enable_task_v2_termination,
+        organization_id=organization_id,
+    )
     skyvern_context.set(
         SkyvernContext(
             organization_id=organization_id,
@@ -608,9 +694,6 @@ async def run_task_v2_helper(
             return workflow, workflow_run, task_v2
 
         LOG.info(f"Task v2 iteration i={i}", workflow_run_id=workflow_run_id, url=url)
-        task_type = ""
-        plan = ""
-        block: BlockTypeVar | None = None
         task_history_record: dict[str, Any] = {}
         context = skyvern_context.ensure_context()
 
@@ -621,49 +704,46 @@ async def run_task_v2_helper(
             browser_session_id=browser_session_id,
             browser_profile_id=workflow_run.browser_profile_id,
         )
-
-        fallback_occurred = False
-        if url != current_url:
-            if page is None:
-                page = await browser_state.get_or_create_page(
-                    url=url,
-                    proxy_location=workflow_run.proxy_location,
-                    task_id=task_v2.task_id,
-                    workflow_run_id=workflow_run_id,
-                    script_id=task_v2.script_id,
-                    organization_id=organization_id,
-                    extra_http_headers=task_v2.extra_http_headers,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-            else:
-                await browser_state.navigate_to_url(page, url)
-
+        page = await browser_state.get_working_page()
+        should_fallback = False
+        # if page is None:
+        #     page = await browser_state.get_or_create_page(
+        #         url=url,
+        #         proxy_location=workflow_run.proxy_location,
+        #         task_id=task_v2.task_id,
+        #         workflow_run_id=workflow_run_id,
+        #         script_id=task_v2.script_id,
+        #         organization_id=organization_id,
+        #         extra_http_headers=task_v2.extra_http_headers,
+        #         browser_profile_id=workflow_run.browser_profile_id,
+        #     )
+        if page:
+            current_url = await SkyvernFrame.get_url(page)
             page_loaded = False
-            if page:
-                try:
-                    # Check if the page has a body element to verify it loaded
-                    # page will always be None if browser state failed to load
-                    page_loaded = await browser_state.validate_browser_context(page)
-                except Exception:
-                    page_loaded = False
-                    LOG.warning(
-                        "Page failed to load properly, fallback to Google",
-                        exc_info=True,
-                        url=url,
-                        current_url=current_url,
-                    )
+            try:
+                # Check if the page has a body element to verify it loaded
+                # page will always be None if browser state failed to load
+                page_loaded = await browser_state.validate_browser_context(page)
+            except Exception:
+                page_loaded = False
+                LOG.warning(
+                    "Page failed to load properly, fallback to Google",
+                    exc_info=True,
+                    url=url,
+                    current_url=current_url,
+                )
 
             if not page_loaded:
                 # Page failed to load properly, fallback to Google
                 if page:
                     try:
                         await page.goto(fallback_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
-                        fallback_occurred = True
+                        should_fallback = True
                     except Exception:
                         LOG.exception("Failed to load Google fallback", exc_info=True, url=url, current_url=current_url)
 
         if i == 0 and current_url != url:
-            if fallback_occurred:
+            if should_fallback:
                 plan = f"Go to Google because the intended website ({url}) failed to load properly."
                 task_type = "goto_url"
                 task_history_record = {"type": task_type, "task": plan}
@@ -704,6 +784,7 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
+                enable_termination=bool(enable_task_v2_termination),
             )
             thought = await app.DATABASE.create_thought(
                 task_v2_id=task_v2_id,
@@ -732,6 +813,8 @@ async def run_task_v2_helper(
             )
             # see if the user goal has achieved or not
             user_goal_achieved = task_v2_response.get("user_goal_achieved", False)
+            should_terminate = task_v2_response.get("should_terminate", False)
+            termination_reason = task_v2_response.get("termination_reason")
             observation = task_v2_response.get("page_info", "")
             thoughts: str = task_v2_response.get("thoughts", "")
             plan = task_v2_response.get("plan", "")
@@ -743,7 +826,12 @@ async def run_task_v2_helper(
                 thought=thoughts,
                 observation=observation,
                 answer=plan,
-                output={"task_type": task_type, "user_goal_achieved": user_goal_achieved},
+                output={
+                    "task_type": task_type,
+                    "user_goal_achieved": user_goal_achieved,
+                    "should_terminate": should_terminate,
+                    "termination_reason": termination_reason,
+                },
             )
 
             if user_goal_achieved is True:
@@ -758,7 +846,25 @@ async def run_task_v2_helper(
                     context=context,
                     screenshots=scraped_page.screenshots,
                 )
+                if task_v2.run_with == "code":
+                    await app.WORKFLOW_SERVICE.generate_script_if_needed(
+                        workflow=workflow,
+                        workflow_run=workflow_run,
+                    )
                 break
+
+            # Only handle termination if the feature flag is enabled
+            if enable_task_v2_termination and should_terminate is True:
+                task_v2 = await _handle_task_v2_termination(
+                    task_v2_id=task_v2_id,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    termination_reason=termination_reason,
+                    iteration=i,
+                )
+                return workflow, workflow_run, task_v2
 
             if not plan:
                 LOG.warning("No plan found in task v2 response", task_v2_response=task_v2_response)
@@ -922,6 +1028,7 @@ async def run_task_v2_helper(
                 user_goal=user_prompt,
                 task_history=task_history,
                 local_datetime=datetime.now(context.tz_info).isoformat(),
+                enable_termination=bool(enable_task_v2_termination),
             )
             thought = await app.DATABASE.create_thought(
                 task_v2_id=task_v2_id,
@@ -946,12 +1053,18 @@ async def run_task_v2_helper(
                 task_history=task_history,
             )
             user_goal_achieved = completion_resp.get("user_goal_achieved", False)
+            should_terminate = completion_resp.get("should_terminate", False)
+            termination_reason = completion_resp.get("termination_reason")
             thought_content = completion_resp.get("thoughts", "")
             await app.DATABASE.update_thought(
                 thought_id=thought.observer_thought_id,
                 organization_id=organization_id,
                 thought=thought_content,
-                output={"user_goal_achieved": user_goal_achieved},
+                output={
+                    "user_goal_achieved": user_goal_achieved,
+                    "should_terminate": should_terminate,
+                    "termination_reason": termination_reason,
+                },
             )
             if user_goal_achieved:
                 LOG.info(
@@ -970,8 +1083,23 @@ async def run_task_v2_helper(
                     await app.WORKFLOW_SERVICE.generate_script_if_needed(
                         workflow=workflow,
                         workflow_run=workflow_run,
+                        finalize=True,  # Force regeneration to ensure field mappings have complete action data
                     )
                 break
+
+            # Only handle termination if the feature flag is enabled
+            if enable_task_v2_termination and should_terminate:
+                task_v2 = await _handle_task_v2_termination(
+                    task_v2_id=task_v2_id,
+                    organization_id=organization_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_id=workflow_id,
+                    workflow_permanent_id=workflow.workflow_permanent_id,
+                    termination_reason=termination_reason,
+                    iteration=i,
+                    source="completion_check",
+                )
+                return workflow, workflow_run, task_v2
 
         # total step number validation
         workflow_run_tasks = await app.DATABASE.get_tasks_by_workflow_run_id(workflow_run_id=workflow_run_id)
@@ -1528,7 +1656,7 @@ async def mark_task_v2_as_failed(
         )
 
     # Add task failure tag to trace
-    TraceManager.add_task_completion_tag("failed")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "failed")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1552,7 +1680,7 @@ async def mark_task_v2_as_completed(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_completed(workflow_run_id)
 
     # Add task completion tag to trace
-    TraceManager.add_task_completion_tag("completed")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "completed")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1572,7 +1700,7 @@ async def mark_task_v2_as_canceled(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_canceled(workflow_run_id)
 
     # Add task canceled tag to trace
-    TraceManager.add_task_completion_tag("canceled")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "canceled")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1593,7 +1721,7 @@ async def mark_task_v2_as_terminated(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_terminated(workflow_run_id, failure_reason)
 
     # Add task terminated tag to trace
-    TraceManager.add_task_completion_tag("terminated")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "terminated")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1614,7 +1742,7 @@ async def mark_task_v2_as_timed_out(
         await app.WORKFLOW_SERVICE.mark_workflow_run_as_timed_out(workflow_run_id, failure_reason)
 
     # Add task timed out tag to trace
-    TraceManager.add_task_completion_tag("timed_out")
+    otel_trace.get_current_span().set_attribute("task.completion_status", "timed_out")
 
     await send_task_v2_webhook(task_v2)
     return task_v2
@@ -1799,6 +1927,7 @@ async def build_task_v2_run_response(task_v2: TaskV2) -> TaskRunResponse:
             error_code_mapping=task_v2.error_code_mapping,
         ),
         errors=workflow_run_resp.errors if workflow_run_resp else None,
+        step_count=workflow_run_resp.step_count if workflow_run_resp else None,
     )
 
 

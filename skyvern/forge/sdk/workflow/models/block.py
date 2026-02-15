@@ -11,17 +11,21 @@ import smtplib
 import textwrap
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, Any, Awaitable, Callable, ClassVar, Literal, Union, cast
 from urllib.parse import quote, urlparse
 
+import aiofiles
+import aiohttp
+import docx
 import filetype
 import pandas as pd
 import pyotp
 import structlog
+from charset_normalizer import from_bytes
 from email_validator import EmailNotValidError, validate_email
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
@@ -32,11 +36,13 @@ from skyvern.config import settings
 from skyvern.constants import (
     AZURE_BLOB_STORAGE_MAX_UPLOAD_FILE_COUNT,
     GET_DOWNLOADED_FILES_TIMEOUT,
+    MAX_FILE_PARSE_INPUT_TOKENS,
     MAX_UPLOAD_FILE_COUNT,
 )
 from skyvern.exceptions import (
     AzureConfigurationError,
     ContextParameterValueNotFound,
+    DownloadFileMaxSizeExceeded,
     MissingBrowserState,
     MissingBrowserStatePage,
     PDFParsingError,
@@ -53,6 +59,7 @@ from skyvern.forge.sdk.api.files import (
     create_named_temporary_file,
     download_file,
     download_from_s3,
+    get_download_dir,
     get_path_for_workflow_download_directory,
     parse_uri_to_path,
 )
@@ -62,14 +69,16 @@ from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.forge.sdk.core.aiohttp_helper import aiohttp_request
 from skyvern.forge.sdk.db.enums import TaskType
+from skyvern.forge.sdk.db.exceptions import NotFoundError
 from skyvern.forge.sdk.experimentation.llm_prompt_config import get_llm_handler_for_prompt_type
 from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
+from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
 from skyvern.forge.sdk.workflow.context_manager import BlockMetadata, WorkflowRunContext
 from skyvern.forge.sdk.workflow.exceptions import (
     CustomizedCodeException,
@@ -94,6 +103,7 @@ from skyvern.schemas.runs import RunEngine
 from skyvern.schemas.workflows import BlockResult, BlockStatus, BlockType, FileStorageType, FileType
 from skyvern.utils.strings import generate_random_string
 from skyvern.utils.templating import get_missing_variables
+from skyvern.utils.token_counter import count_tokens
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.browser_state import BrowserState
 from skyvern.webeye.utils.page import SkyvernFrame
@@ -104,6 +114,27 @@ if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
     jinja_sandbox_env = SandboxedEnvironment(undefined=StrictUndefined)
 else:
     jinja_sandbox_env = SandboxedEnvironment()
+
+
+# Sentinel marker for native JSON type injection via | json filter.
+_JSON_TYPE_MARKER = "__SKYVERN_RAW_JSON__"
+
+
+def _json_type_filter(value: Any) -> str:
+    """Jinja filter that marks a value for native JSON type injection.
+
+    Usage in templates: {{ some_bool | json }}
+
+    The filter serializes the value to JSON and wraps it with sentinel markers.
+    When _render_templates_in_json() detects these markers, it unwraps and
+    parses the JSON to get the native typed value (bool, int, list, etc.).
+
+    Uses default=str to handle non-JSON-serializable types (datetime, Enum, etc.)
+    """
+    return f"{_JSON_TYPE_MARKER}{json.dumps(value, default=str)}{_JSON_TYPE_MARKER}"
+
+
+jinja_sandbox_env.filters["json"] = _json_type_filter
 
 
 # Mapping from TaskV2Status to the corresponding BlockStatus. Declared once at
@@ -216,6 +247,57 @@ class Block(BaseModel, abc.ABC):
             workflow_run_block_id=workflow_run_block_id,
         )
 
+    async def get_or_create_browser_state(
+        self,
+        workflow_run_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+    ) -> BrowserState | None:
+        """
+        Acquire or create browser state for block execution.
+
+        Checks persistent sessions first (debugger use case), then falls back to
+        workflow run browser manager. If no state exists, creates a new one.
+
+        Returns BrowserState if successful, None if creation failed.
+        """
+        browser_state: BrowserState | None = None
+
+        if browser_session_id and organization_id:
+            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
+        else:
+            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
+
+        if not browser_state:
+            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
+                workflow_run_id=workflow_run_id,
+                organization_id=organization_id,
+            )
+            try:
+                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
+                    workflow_run=workflow_run,
+                    url=None,
+                    browser_session_id=browser_session_id,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+                await browser_state.check_and_fix_state(
+                    url=None,
+                    proxy_location=workflow_run.proxy_location,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=workflow_run.organization_id,
+                    extra_http_headers=workflow_run.extra_http_headers,
+                    browser_address=workflow_run.browser_address,
+                    browser_profile_id=workflow_run.browser_profile_id,
+                )
+            except Exception:
+                LOG.exception(
+                    "Failed to create browser state",
+                    workflow_run_id=workflow_run_id,
+                )
+                return None
+
+        return browser_state
+
     def format_block_parameter_template_from_workflow_run_context(
         self,
         potential_template: str,
@@ -317,6 +399,9 @@ class Block(BaseModel, abc.ABC):
         if "workflow_run_id" not in template_data:
             template_data["workflow_run_id"] = workflow_run_context.workflow_run_id
 
+        template_data["workflow_run_outputs"] = workflow_run_context.workflow_run_outputs
+        template_data["workflow_run_summary"] = workflow_run_context.build_workflow_run_summary()
+
         if settings.WORKFLOW_TEMPLATING_STRICTNESS == "strict":
             if missing_variables := get_missing_variables(potential_template, template_data):
                 raise MissingJinjaVariables(
@@ -395,7 +480,7 @@ class Block(BaseModel, abc.ABC):
                 organization_id=organization_id,
             )
 
-    @TraceManager.traced_async(ignore_inputs=["kwargs"])
+    @traced()
     async def execute_safe(
         self,
         workflow_run_id: str,
@@ -863,11 +948,11 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
                 )
-                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
@@ -875,8 +960,8 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(
                     updated_task,
                     downloaded_files,
-                    task_screenshots=task_screenshots,
-                    workflow_screenshots=workflow_screenshots,
+                    task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                    workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
                 output_parameter_value = task_output.model_dump()
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output_parameter_value)
@@ -939,11 +1024,11 @@ class BaseTaskBlock(Block):
                 except asyncio.TimeoutError:
                     LOG.warning("Timeout getting downloaded files", task_id=updated_task.task_id)
 
-                task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+                task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
                     organization_id=workflow_run.organization_id,
                     task_id=updated_task.task_id,
                 )
-                workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+                workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
                     workflow_run_id=workflow_run_id,
                     organization_id=workflow_run.organization_id,
                 )
@@ -951,8 +1036,8 @@ class BaseTaskBlock(Block):
                 task_output = TaskOutput.from_task(
                     updated_task,
                     downloaded_files,
-                    task_screenshots=task_screenshots,
-                    workflow_screenshots=workflow_screenshots,
+                    task_screenshot_artifact_ids=[a.artifact_id for a in task_screenshot_artifacts],
+                    workflow_screenshot_artifact_ids=[a.artifact_id for a in workflow_screenshot_artifacts],
                 )
                 LOG.warning(
                     f"Task failed with status {updated_task.status}{retry_message}",
@@ -1033,6 +1118,74 @@ class LoopBlockExecutedResult(BaseModel):
             return f"Block({self.last_block.label if self.last_block else ''}) with type {self.last_block.block_type if self.last_block else ''} was canceled, canceling for loop"
 
         return self.block_outputs[-1].failure_reason if len(self.block_outputs) > 0 else "No block has been executed"
+
+
+def compute_conditional_scopes(
+    label_to_block: dict[str, Any],
+    default_next_map: dict[str, str | None],
+) -> dict[str, str]:
+    """Map each block label to the conditional block label whose scope it belongs to.
+
+    For each conditional block, trace each branch's chain of blocks via
+    ``default_next_map``.  Labels that appear in **all** branch chains are
+    considered merge-point blocks (i.e. they come *after* the conditional
+    reconverges) and are **not** scoped.  Labels that appear in fewer chains
+    than the total number of branches **are** inside the conditional.
+
+    Inner conditionals are themselves scoped to an outer conditional, but
+    their *own* branch targets are handled by a recursive application of
+    the same logic (inner wins via the ``if lbl not in scopes`` guard).
+    """
+    scopes: dict[str, str] = {}
+
+    conditional_labels = [lbl for lbl, blk in label_to_block.items() if blk.block_type == BlockType.CONDITIONAL]
+
+    for cond_label in conditional_labels:
+        cond_block = label_to_block[cond_label]
+        branch_targets: list[str | None] = [branch.next_block_label for branch in cond_block.ordered_branches]
+        # Deduplicate while preserving order – two branches may point to the same target
+        seen_targets: set[str | None] = set()
+        unique_targets: list[str | None] = []
+        for t in branch_targets:
+            if t not in seen_targets:
+                seen_targets.add(t)
+                unique_targets.append(t)
+
+        num_branches = len(unique_targets)
+        if num_branches == 0:
+            continue
+
+        # For each unique branch target, trace the chain via default_next_map.
+        # Stop at other conditional blocks (they handle their own branches).
+        chain_sets: list[list[str]] = []
+        for target in unique_targets:
+            chain: list[str] = []
+            cur = target
+            while cur and cur in label_to_block:
+                chain.append(cur)
+                # Stop tracing when we hit another conditional – it owns its own sub-tree
+                if label_to_block[cur].block_type == BlockType.CONDITIONAL:
+                    break
+                cur = default_next_map.get(cur)
+            chain_sets.append(chain)
+
+        # Count how many branch chains each label appears in
+        label_count: dict[str, int] = {}
+        for chain in chain_sets:
+            for lbl in chain:
+                label_count[lbl] = label_count.get(lbl, 0) + 1
+
+        # Labels appearing in ALL branches are merge points (after the conditional).
+        # Labels appearing in fewer branches are inside the conditional.
+        for chain in chain_sets:
+            for lbl in chain:
+                if label_count[lbl] >= num_branches:
+                    # This is a merge point – stop scoping further along this chain
+                    break
+                if lbl not in scopes:
+                    scopes[lbl] = cond_label
+
+    return scopes
 
 
 class ForLoopBlock(Block):
@@ -1422,6 +1575,7 @@ class ForLoopBlock(Block):
         current_block: BlockTypeVar | None = None
 
         start_label, label_to_block, default_next_map = self._build_loop_graph(self.loop_blocks)
+        conditional_scopes = compute_conditional_scopes(label_to_block, default_next_map)
 
         for loop_idx, loop_over_value in enumerate(loop_over_values):
             # Check max_iterations limit
@@ -1463,6 +1617,7 @@ class ForLoopBlock(Block):
 
             block_idx = 0
             current_label: str | None = start_label
+            conditional_wrb_ids: dict[str, str] = {}
             while current_label:
                 loop_block = label_to_block.get(current_label)
                 if not loop_block:
@@ -1499,12 +1654,26 @@ class ForLoopBlock(Block):
                 loop_block = loop_block.model_copy(deep=True)
                 current_block = loop_block
 
+                # Determine the parent for timeline nesting: if this block is
+                # inside a conditional's scope, parent it to that conditional's
+                # workflow_run_block rather than the loop's.
+                parent_wrb_id = workflow_run_block_id
+                if current_label in conditional_scopes:
+                    cond_label = conditional_scopes[current_label]
+                    if cond_label in conditional_wrb_ids:
+                        parent_wrb_id = conditional_wrb_ids[cond_label]
+
                 block_output = await loop_block.execute_safe(
                     workflow_run_id=workflow_run_id,
-                    parent_workflow_run_block_id=workflow_run_block_id,
+                    parent_workflow_run_block_id=parent_wrb_id,
                     organization_id=organization_id,
                     browser_session_id=browser_session_id,
                 )
+
+                # Track conditional workflow_run_block_ids so branch targets
+                # can be parented to them.
+                if loop_block.block_type == BlockType.CONDITIONAL and block_output.workflow_run_block_id:
+                    conditional_wrb_ids[current_label] = block_output.workflow_run_block_id
 
                 output_value = (
                     workflow_run_context.get_value(block_output.output_parameter.key)
@@ -1875,63 +2044,11 @@ async def wrapper():
     ) -> BlockResult:
         await app.AGENT_FUNCTION.validate_code_block(organization_id=organization_id)
 
-        # TODO: only support to use code block to manupilate the browser page
-        # support browser context in the future
-        browser_state: BrowserState | None = None
-        if browser_session_id and organization_id:
-            LOG.info(
-                "Getting browser state for workflow run from persistent sessions manager",
-                browser_session_id=browser_session_id,
-            )
-            browser_state = await app.PERSISTENT_SESSIONS_MANAGER.get_browser_state(browser_session_id, organization_id)
-            if browser_state:
-                LOG.info("Was occupying session here, but no longer.", browser_session_id=browser_session_id)
-        else:
-            browser_state = app.BROWSER_MANAGER.get_for_workflow_run(workflow_run_id)
-
-        # If no browser state exists, create one (e.g., when code block is the first block)
-        if not browser_state:
-            LOG.info(
-                "No browser state found, creating one for code block execution",
-                workflow_run_id=workflow_run_id,
-                browser_session_id=browser_session_id,
-            )
-            workflow_run = await app.WORKFLOW_SERVICE.get_workflow_run(
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-            try:
-                browser_state = await app.BROWSER_MANAGER.get_or_create_for_workflow_run(
-                    workflow_run=workflow_run,
-                    url=None,  # Code block doesn't need to navigate to a URL initially
-                    browser_session_id=browser_session_id,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-                # Ensure the browser state has a working page
-                await browser_state.check_and_fix_state(
-                    url=None,  # Don't navigate to any URL, just ensure a page exists
-                    proxy_location=workflow_run.proxy_location,
-                    workflow_run_id=workflow_run_id,
-                    organization_id=workflow_run.organization_id,
-                    extra_http_headers=workflow_run.extra_http_headers,
-                    browser_address=workflow_run.browser_address,
-                    browser_profile_id=workflow_run.browser_profile_id,
-                )
-            except Exception as e:
-                LOG.exception(
-                    "Failed to create browser state for code block",
-                    workflow_run_id=workflow_run_id,
-                    error=str(e),
-                )
-                return await self.build_block_result(
-                    success=False,
-                    failure_reason=f"Failed to create browser for code block: {str(e)}",
-                    output_parameter_value=None,
-                    status=BlockStatus.failed,
-                    workflow_run_block_id=workflow_run_block_id,
-                    organization_id=organization_id,
-                )
-
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
         if not browser_state:
             return await self.build_block_result(
                 success=False,
@@ -3034,13 +3151,49 @@ class FileParserBlock(Block):
             return FileType.PDF
         elif suffix == ".tsv":
             return FileType.CSV  # TSV files are handled by the CSV parser
+        elif suffix in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff", ".tif"):
+            return FileType.IMAGE
+        elif suffix == ".docx":
+            return FileType.DOCX
+        elif suffix == ".doc":
+            raise InvalidFileType(
+                file_url=file_url,
+                file_type=FileType.DOCX,
+                error="Legacy .doc format (Word 97-2003) is not supported. Please convert the file to .docx format.",
+            )
         else:
             return FileType.CSV  # Default to CSV for .csv and any other extensions
+
+    def _detect_file_encoding(self, file_path: str) -> str:
+        """Detect the encoding of a file using charset-normalizer with fallbacks.
+
+        Reads a sample of the file (first 64KB) to detect encoding efficiently.
+        Falls back through common encodings if detection fails.
+        """
+        sample_size = 65536  # 64KB sample for detection
+        with open(file_path, "rb") as f:
+            raw_data = f.read(sample_size)
+
+        result = from_bytes(raw_data)
+        best_match = result.best()
+        if best_match and best_match.encoding:
+            return best_match.encoding
+
+        for encoding in ["utf-8", "cp1252", "latin-1"]:
+            try:
+                raw_data.decode(encoding)
+                return encoding
+            except UnicodeDecodeError:
+                continue
+
+        # latin-1 always succeeds (1:1 byte mapping), so this is a safety fallback
+        return "latin-1"
 
     def validate_file_type(self, file_url_used: str, file_path: str) -> None:
         if self.file_type == FileType.CSV:
             try:
-                with open(file_path) as file:
+                encoding = self._detect_file_encoding(file_path)
+                with open(file_path, encoding=encoding, errors="replace") as file:
                     csv.Sniffer().sniff(file.read(1024))
             except csv.Error as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
@@ -3057,11 +3210,26 @@ class FileParserBlock(Block):
                 validate_pdf_file(file_path, file_identifier=file_url_used)
             except PDFParsingError as e:
                 raise InvalidFileType(file_url=file_url_used, file_type=self.file_type, error=str(e))
+        elif self.file_type == FileType.IMAGE:
+            kind = filetype.guess(file_path)
+            if kind is None or not kind.mime.startswith("image/"):
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error="File is not a valid image"
+                )
+        elif self.file_type == FileType.DOCX:
+            try:
+                # Try to open the file with python-docx to validate it's a valid DOCX file
+                docx.Document(file_path)
+            except Exception as e:
+                raise InvalidFileType(
+                    file_url=file_url_used, file_type=self.file_type, error=f"Invalid DOCX file format: {str(e)}"
+                )
 
     async def _parse_csv_file(self, file_path: str) -> list[dict[str, Any]]:
         """Parse CSV/TSV file and return list of dictionaries."""
         parsed_data = []
-        with open(file_path) as file:
+        encoding = self._detect_file_encoding(file_path)
+        with open(file_path, encoding=encoding, errors="replace") as file:
             # Try to detect the delimiter (comma for CSV, tab for TSV)
             sample = file.read(1024)
             file.seek(0)  # Reset file pointer
@@ -3128,6 +3296,97 @@ class FileParserBlock(Block):
         except PDFParsingError as e:
             raise InvalidFileType(file_url=self.file_url, file_type=self.file_type, error=str(e))
 
+    async def _parse_image_file(self, file_path: str) -> str:
+        """Parse image file using vision LLM for OCR."""
+        try:
+            with open(file_path, "rb") as f:
+                image_bytes = f.read()
+
+            llm_prompt = prompt_engine.load_prompt("extract-text-from-image")
+            llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
+                self.override_llm_key, default=app.LLM_API_HANDLER
+            )
+            llm_response = await llm_api_handler(
+                prompt=llm_prompt,
+                prompt_name="extract-text-from-image",
+                screenshots=[image_bytes],
+                force_dict=True,
+            )
+            return llm_response.get("extracted_text", "")
+        except Exception:
+            LOG.exception("Failed to extract text from image via OCR", file_url=self.file_url)
+            raise
+
+    async def _parse_docx_file(self, file_path: str, max_tokens: int = MAX_FILE_PARSE_INPUT_TOKENS) -> str:
+        """Parse DOCX file and return extracted text.
+
+        Extracts text from all paragraphs and tables in the document,
+        respecting the token limit.
+        """
+        try:
+            document = docx.Document(file_path)
+            text_parts = []
+            current_tokens = 0
+            truncated = False
+
+            # Extract text from paragraphs
+            for paragraph in document.paragraphs:
+                if paragraph.text.strip():
+                    para_tokens = count_tokens(paragraph.text)
+                    if max_tokens and current_tokens + para_tokens > max_tokens:
+                        LOG.warning(
+                            "DOCX text exceeds token limit, truncating",
+                            file_url=self.file_url,
+                            current_tokens=current_tokens,
+                            max_tokens=max_tokens,
+                        )
+                        truncated = True
+                        break
+                    text_parts.append(paragraph.text)
+                    current_tokens += para_tokens
+
+            # Extract text from tables (only if not already truncated)
+            if not truncated:
+                for table in document.tables:
+                    if truncated:
+                        break
+                    for row in table.rows:
+                        row_text = []
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            if cell_text:
+                                row_text.append(cell_text)
+                        if row_text:
+                            row_str = " | ".join(row_text)
+                            row_tokens = count_tokens(row_str)
+                            if max_tokens and current_tokens + row_tokens > max_tokens:
+                                LOG.warning(
+                                    "DOCX text exceeds token limit, truncating at table",
+                                    file_url=self.file_url,
+                                    current_tokens=current_tokens,
+                                    max_tokens=max_tokens,
+                                )
+                                truncated = True
+                                break
+                            text_parts.append(row_str)
+                            current_tokens += row_tokens
+
+            extracted_text = "\n".join(text_parts)
+            extracted_text = sanitize_postgres_text(extracted_text)
+            LOG.info(
+                "Successfully parsed DOCX file",
+                file_url=self.file_url,
+                paragraph_count=len(document.paragraphs),
+                table_count=len(document.tables),
+                text_length=len(extracted_text),
+                truncated=truncated,
+            )
+            return extracted_text
+        except Exception as e:
+            raise InvalidFileType(
+                file_url=self.file_url, file_type=self.file_type, error=f"Failed to parse DOCX file: {str(e)}"
+            )
+
     async def _extract_with_ai(
         self, content: str | list[dict[str, Any]], workflow_run_context: WorkflowRunContext
     ) -> dict[str, Any]:
@@ -3154,9 +3413,8 @@ class FileParserBlock(Block):
             "extract-information-from-file-text", extracted_text_content=content_str, json_schema=schema_to_use
         )
 
-        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(
-            self.override_llm_key, default=app.LLM_API_HANDLER
-        )
+        llm_key = self.override_llm_key
+        llm_api_handler = LLMAPIHandlerFactory.get_override_llm_api_handler(llm_key, default=app.LLM_API_HANDLER)
 
         llm_response = await llm_api_handler(
             prompt=llm_prompt, prompt_name="extract-information-from-file-text", force_dict=False
@@ -3205,9 +3463,9 @@ class FileParserBlock(Block):
         else:
             file_path = await download_file(self.file_url)
 
-        # Auto-detect file type based on file extension
-        detected_file_type = self._detect_file_type_from_url(self.file_url)
-        self.file_type = detected_file_type
+        # Auto-detect file type if not explicitly set (IMAGE/EXCEL/PDF/DOCX are explicit choices)
+        if self.file_type not in (FileType.IMAGE, FileType.EXCEL, FileType.PDF, FileType.DOCX):
+            self.file_type = self._detect_file_type_from_url(self.file_url)
 
         # Validate the file type
         self.validate_file_type(self.file_url, file_path)
@@ -3227,6 +3485,10 @@ class FileParserBlock(Block):
             parsed_data = await self._parse_excel_file(file_path)
         elif self.file_type == FileType.PDF:
             parsed_data = await self._parse_pdf_file(file_path)
+        elif self.file_type == FileType.IMAGE:
+            parsed_data = await self._parse_image_file(file_path)
+        elif self.file_type == FileType.DOCX:
+            parsed_data = await self._parse_docx_file(file_path)
         else:
             return await self.build_block_result(
                 success=False,
@@ -3909,11 +4171,11 @@ class TaskV2Block(Block):
 
         # If continue_on_failure is True, we treat the block as successful even if the task failed
         # This allows the workflow to continue execution despite this block's failure
-        task_screenshots = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_urls(
+        task_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_task_screenshot_artifacts(
             organization_id=organization_id,
             task_v2_id=task_v2.observer_cruise_id,
         )
-        workflow_screenshots = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_urls(
+        workflow_screenshot_artifacts = await app.WORKFLOW_SERVICE.get_recent_workflow_screenshot_artifacts(
             workflow_run_id=workflow_run_id,
             organization_id=organization_id,
         )
@@ -3924,8 +4186,8 @@ class TaskV2Block(Block):
             "summary": task_v2.summary,
             "extracted_information": result_dict,
             "failure_reason": failure_reason,
-            "task_screenshots": task_screenshots,
-            "workflow_screenshots": workflow_screenshots,
+            "task_screenshot_artifact_ids": [a.artifact_id for a in task_screenshot_artifacts],
+            "workflow_screenshot_artifact_ids": [a.artifact_id for a in workflow_screenshot_artifacts],
         }
         await self.record_output_parameter_value(workflow_run_context, workflow_run_id, task_v2_output)
         return await self.build_block_result(
@@ -3951,6 +4213,8 @@ class HttpRequestBlock(Block):
     files: dict[str, str] | None = None  # Dictionary mapping field names to file paths for multipart file uploads
     timeout: int = 30
     follow_redirects: bool = True
+    download_filename: str | None = None
+    save_response_as_file: bool = False
 
     # Parameters for templating
     parameters: list[PARAMETER_TYPE] = []
@@ -4002,11 +4266,30 @@ class HttpRequestBlock(Block):
 
             This is required because HTTP request bodies are often deeply nested
             dict/list structures, and templates may appear at any depth.
+
+            Supports {{ expr | json }} filter for type-preserving JSON injection.
             """
             if isinstance(value, str):
-                return self.format_block_parameter_template_from_workflow_run_context(
+                rendered = self.format_block_parameter_template_from_workflow_run_context(
                     value, workflow_run_context, **template_kwargs
                 )
+
+                if rendered.startswith(_JSON_TYPE_MARKER) and rendered.endswith(_JSON_TYPE_MARKER):
+                    json_str = rendered[len(_JSON_TYPE_MARKER) : -len(_JSON_TYPE_MARKER)]
+                    try:
+                        return json.loads(json_str)
+                    except json.JSONDecodeError:
+                        raise FailedToFormatJinjaStyleParameter(
+                            value, f"Raw JSON filter produced invalid JSON: {json_str}"
+                        )
+                elif _JSON_TYPE_MARKER in rendered:
+                    raise FailedToFormatJinjaStyleParameter(
+                        value,
+                        "The '| json' filter can only be used for complete value replacement. "
+                        "It cannot be combined with other text (e.g., 'prefix-{{ val | json }}'). "
+                        "Remove the surrounding text or remove the '| json' filter.",
+                    )
+                return rendered
             if isinstance(value, list):
                 return [_render_templates_in_json(item) for item in value]
             if isinstance(value, dict):
@@ -4030,6 +4313,11 @@ class HttpRequestBlock(Block):
         if self.headers:
             self.headers = cast(dict[str, str], _render_templates_in_json(self.headers))
 
+        if self.download_filename:
+            self.download_filename = self.format_block_parameter_template_from_workflow_run_context(
+                self.download_filename, workflow_run_context, **template_kwargs
+            )
+
     def validate_url(self, url: str) -> bool:
         """Validate if the URL is properly formatted"""
         try:
@@ -4037,6 +4325,92 @@ class HttpRequestBlock(Block):
             return all([result.scheme, result.netloc])
         except Exception:
             return False
+
+    async def _execute_file_download(
+        self,
+        workflow_run_context: WorkflowRunContext,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None,
+    ) -> BlockResult:
+        if not self.url:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="URL is required for file download",
+                output_parameter_value=None,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        try:
+            max_size_mb = settings.MAX_HTTP_DOWNLOAD_FILE_SIZE // (1024 * 1024)
+            output_dir = get_download_dir(workflow_run_id)
+            file_path = await download_file(
+                self.url,
+                max_size_mb=max_size_mb,
+                headers=self.headers,
+                output_dir=output_dir,
+                filename=self.download_filename,
+            )
+
+            response_data = {
+                "file_path": file_path,
+                "file_name": os.path.basename(file_path),
+                "file_size": os.path.getsize(file_path),
+            }
+
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
+
+            return await self.build_block_result(
+                success=True,
+                failure_reason=None,
+                output_parameter_value=response_data,
+                status=BlockStatus.completed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        except aiohttp.ClientResponseError as e:
+            error_data = {"error": f"HTTP {e.status}", "error_type": "http_error"}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"HTTP {e.status}",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except DownloadFileMaxSizeExceeded as e:
+            max_size_str = f"{e.max_size:.1f}"
+            error_data = {"error": f"File exceeds maximum size of {max_size_str}MB", "error_type": "file_too_large"}
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"File exceeds maximum size of {max_size_str}MB",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+        except Exception as e:
+            error_data = {"error": str(e), "error_type": "unknown"}
+            LOG.warning(
+                "File download failed",
+                error=str(e),
+                url=self.url,
+                workflow_run_id=workflow_run_id,
+            )
+            await self.record_output_parameter_value(workflow_run_context, workflow_run_id, error_data)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"File download failed: {str(e)}",
+                output_parameter_value=error_data,
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
 
     async def execute(
         self,
@@ -4209,7 +4583,14 @@ class HttpRequestBlock(Block):
             # Update self.files with local file paths
             self.files = downloaded_files
 
-        # Execute HTTP request using the generic aiohttp_request function
+        if self.save_response_as_file:
+            return await self._execute_file_download(
+                workflow_run_context=workflow_run_context,
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
         try:
             LOG.info(
                 "Executing HTTP request",
@@ -4221,7 +4602,6 @@ class HttpRequestBlock(Block):
                 files=self.files,
             )
 
-            # Use the generic aiohttp_request function
             status_code, response_headers, response_body = await aiohttp_request(
                 method=self.method,
                 url=self.url,
@@ -4233,22 +4613,18 @@ class HttpRequestBlock(Block):
             )
 
             response_data = {
-                # Response information
                 "status_code": status_code,
                 "response_headers": response_headers,
                 "response_body": response_body,
-                # Request information (what was sent)
                 "request_method": self.method,
                 "request_url": self.url,
                 "request_headers": self.headers,
                 "request_body": self.body,
-                # Backwards compatibility
                 "headers": response_headers,
                 "body": response_body,
                 "url": self.url,
             }
 
-            # Mask secrets in output to prevent credential exposure in DB/UI
             response_data = workflow_run_context.mask_secrets_in_data(response_data)
 
             LOG.info(
@@ -4260,14 +4636,14 @@ class HttpRequestBlock(Block):
                 response_data=response_data,
             )
 
-            # Determine success based on status code
             success = 200 <= status_code < 300
+            failure_reason = None if success else f"HTTP {status_code}: {response_data.get('response_body', '')}"
 
             await self.record_output_parameter_value(workflow_run_context, workflow_run_id, response_data)
 
             return await self.build_block_result(
                 success=success,
-                failure_reason=None if success else f"HTTP {status_code}: {response_body}",
+                failure_reason=failure_reason,
                 output_parameter_value=response_data,
                 status=BlockStatus.completed if success else BlockStatus.failed,
                 workflow_run_block_id=workflow_run_block_id,
@@ -4287,7 +4663,7 @@ class HttpRequestBlock(Block):
             )
         except Exception as e:
             error_data = {"error": str(e), "error_type": "unknown"}
-            LOG.warning(  # Changed from LOG.exception to LOG.warning as requested
+            LOG.warning(
                 "HTTP request failed with unexpected error",
                 error=str(e),
                 url=self.url,
@@ -4303,6 +4679,194 @@ class HttpRequestBlock(Block):
                 workflow_run_block_id=workflow_run_block_id,
                 organization_id=organization_id,
             )
+
+
+class PrintPageBlock(Block):
+    block_type: Literal[BlockType.PRINT_PAGE] = BlockType.PRINT_PAGE  # type: ignore
+
+    include_timestamp: bool = True
+    custom_filename: str | None = None
+    format: str = "A4"
+    landscape: bool = False
+    print_background: bool = True
+    parameters: list[PARAMETER_TYPE] = []
+
+    VALID_FORMATS: ClassVar[set[str]] = {"A4", "Letter", "Legal", "Tabloid"}
+
+    def get_all_parameters(self, workflow_run_id: str) -> list[PARAMETER_TYPE]:
+        return self.parameters
+
+    @staticmethod
+    def _sanitize_filename(filename: str) -> str:
+        sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
+        sanitized = sanitized.strip(". ")
+        return sanitized[:200] if sanitized else "document"
+
+    def _build_pdf_options(self) -> dict[str, Any]:
+        pdf_format = self.format if self.format in self.VALID_FORMATS else "A4"
+        pdf_options: dict[str, Any] = {
+            "format": pdf_format,
+            "landscape": self.landscape,
+            "print_background": self.print_background,
+        }
+
+        if self.include_timestamp:
+            pdf_options["display_header_footer"] = True
+            pdf_options["header_template"] = (
+                '<div style="font-size:10px;width:100%;display:flex;justify-content:space-between;padding:0 10px;">'
+                '<span class="date"></span><span class="title"></span><span></span></div>'
+            )
+            pdf_options["footer_template"] = (
+                '<div style="font-size:10px;width:100%;display:flex;justify-content:space-between;padding:0 10px;">'
+                '<span class="url"></span><span></span><span><span class="pageNumber"></span>/<span class="totalPages"></span></span></div>'
+            )
+            pdf_options["margin"] = {"top": "40px", "bottom": "40px"}
+
+        return pdf_options
+
+    async def _upload_pdf_artifact(
+        self,
+        *,
+        pdf_bytes: bytes,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        workflow_run_context: WorkflowRunContext,
+        organization_id: str | None,
+    ) -> str | None:
+        artifact_org_id = organization_id or workflow_run_context.organization_id
+        if not artifact_org_id:
+            LOG.warning(
+                "PrintPageBlock: Missing organization_id, skipping artifact upload",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+            )
+            return None
+
+        try:
+            workflow_run_block = await app.DATABASE.get_workflow_run_block(
+                workflow_run_block_id,
+                organization_id=artifact_org_id,
+            )
+        except NotFoundError:
+            LOG.warning(
+                "PrintPageBlock: Workflow run block not found, skipping artifact upload",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=artifact_org_id,
+            )
+            return None
+
+        _, artifact_uri = await app.ARTIFACT_MANAGER.create_workflow_run_block_artifact_with_uri(
+            workflow_run_block=workflow_run_block,
+            artifact_type=ArtifactType.PDF,
+            data=pdf_bytes,
+        )
+        try:
+            await app.ARTIFACT_MANAGER.wait_for_upload_aiotasks([workflow_run_block.workflow_run_block_id])
+        except Exception:
+            LOG.warning(
+                "PrintPageBlock: Failed to upload PDF artifact",
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block.workflow_run_block_id,
+                exc_info=True,
+            )
+            return None
+
+        return artifact_uri
+
+    async def execute(
+        self,
+        workflow_run_id: str,
+        workflow_run_block_id: str,
+        organization_id: str | None = None,
+        browser_session_id: str | None = None,
+        **kwargs: dict,
+    ) -> BlockResult:
+        workflow_run_context = self.get_workflow_run_context(workflow_run_id)
+
+        browser_state = await self.get_or_create_browser_state(
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            browser_session_id=browser_session_id,
+        )
+        if not browser_state:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No browser state available",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        page = await browser_state.get_working_page()
+        if not page:
+            return await self.build_block_result(
+                success=False,
+                failure_reason="No page available",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        pdf_options = self._build_pdf_options()
+
+        try:
+            pdf_bytes = await page.pdf(**pdf_options)
+        except Exception as e:
+            error_msg = str(e)
+            if "pdf" in error_msg.lower() and ("not supported" in error_msg.lower() or "chromium" in error_msg.lower()):
+                error_msg = "PDF generation requires Chromium browser. Current browser does not support page.pdf()."
+            LOG.warning("PrintPageBlock: Failed to generate PDF", error=error_msg, workflow_run_id=workflow_run_id)
+            return await self.build_block_result(
+                success=False,
+                failure_reason=f"Failed to generate PDF: {error_msg}",
+                status=BlockStatus.failed,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+            )
+
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        if self.custom_filename:
+            filename = self.format_block_parameter_template_from_workflow_run_context(
+                self.custom_filename, workflow_run_context
+            )
+            filename = self._sanitize_filename(filename)
+            if not filename.endswith(".pdf"):
+                filename += ".pdf"
+        else:
+            filename = f"page_{timestamp_str}.pdf"
+
+        # Save PDF to download directory so it appears in runs UI
+        download_dir = get_download_dir(workflow_run_id)
+        file_path = os.path.join(download_dir, filename)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(pdf_bytes)
+
+        # Upload to artifact storage for downstream block access (e.g., File Extraction Block)
+        artifact_uri = await self._upload_pdf_artifact(
+            pdf_bytes=pdf_bytes,
+            workflow_run_id=workflow_run_id,
+            workflow_run_block_id=workflow_run_block_id,
+            workflow_run_context=workflow_run_context,
+            organization_id=organization_id,
+        )
+
+        output = {
+            "filename": filename,
+            "file_path": file_path,
+            "size_bytes": len(pdf_bytes),
+            "artifact_uri": artifact_uri,
+        }
+        await self.record_output_parameter_value(workflow_run_context, workflow_run_id, output)
+
+        return await self.build_block_result(
+            success=True,
+            failure_reason=None,
+            output_parameter_value=output,
+            status=BlockStatus.completed,
+            workflow_run_block_id=workflow_run_block_id,
+            organization_id=organization_id,
+        )
 
 
 class BranchEvaluationContext:
@@ -4321,35 +4885,58 @@ class BranchEvaluationContext:
 
     def build_llm_safe_context_snapshot(self) -> dict[str, Any]:
         """
-        Build a non-secret context blob for LLM-facing branch evaluation.
+        Build a minimal context blob for LLM-facing branch evaluation.
 
-        Secrets are stripped/masked; only params/outputs/environment and cached
-        block metadata are included so the LLM can ground purely natural language
-        expressions without requiring inline templating.
+        Only includes essential data the LLM needs to evaluate conditions:
+        - Parameter values (base_date, date_1, etc.)
+        - Extracted information from previous blocks
+        - Loop variables (current_value, current_index, current_item)
         """
         if self.workflow_run_context is None:
             return {}
 
         ctx = self.workflow_run_context
+        raw_values: dict[str, Any] = ctx.values.copy()
 
-        # Start from the recorded values (params, outputs, env, block outputs)
-        snapshot: dict[str, Any] = ctx.values.copy()
+        # Keys to skip - these are not useful for evaluating conditions
+        keys_to_skip = {
+            "blocks_metadata",
+            "params",
+            "outputs",
+            "environment",
+            "env",
+            "llm",
+            "workflow_title",
+            "workflow_id",
+            "workflow_permanent_id",
+            "workflow_run_id",
+        }
 
-        # Add block metadata (e.g., loop indices/current_item) without mutating originals
-        snapshot["blocks_metadata"] = ctx.blocks_metadata.copy()
+        snapshot: dict[str, Any] = {}
+        for key, value in raw_values.items():
+            # Skip noisy keys
+            if key in keys_to_skip:
+                continue
 
-        # Ensure the common namespaces exist
-        snapshot.setdefault("params", snapshot.get("params", {}))
-        snapshot.setdefault("outputs", snapshot.get("outputs", {}))
-        snapshot.setdefault("environment", snapshot.get("environment", {}))
-        snapshot.setdefault("env", snapshot.get("environment", {}))
-        snapshot.setdefault("llm", snapshot.get("llm", {}))
+            # For block outputs (dicts with extracted_information), only include extracted_information
+            if isinstance(value, dict) and "extracted_information" in value:
+                extracted = value.get("extracted_information")
+                if extracted is not None:
+                    snapshot[key] = extracted
+            else:
+                # Include parameter values directly
+                snapshot[key] = value
 
-        # Standard workflow identifiers for additional context
-        snapshot.setdefault("workflow_title", ctx.workflow_title)
-        snapshot.setdefault("workflow_id", ctx.workflow_id)
-        snapshot.setdefault("workflow_permanent_id", ctx.workflow_permanent_id)
-        snapshot.setdefault("workflow_run_id", ctx.workflow_run_id)
+        # Copy loop variables (current_value, current_index, current_item) to top level
+        # Required for pure NatLang expressions like "current_value['date']" to work
+        if self.block_label:
+            block_metadata = ctx.get_block_metadata(self.block_label)
+            if "current_value" in block_metadata:
+                snapshot["current_value"] = block_metadata["current_value"]
+            if "current_index" in block_metadata:
+                snapshot["current_index"] = block_metadata["current_index"]
+            if "current_item" in block_metadata:
+                snapshot["current_item"] = block_metadata["current_item"]
 
         # Mask any real secret values that may have leaked into values
         snapshot = ctx.mask_secrets_in_data(snapshot)
@@ -4518,6 +5105,256 @@ class PromptBranchCriteria(BranchCriteria):
         return True
 
 
+def _is_pure_jinja_expression(expression: str) -> bool:
+    """
+    Determine if an expression is a pure Jinja template (single block) vs Jinja+NatLang (mixed).
+
+    Pure Jinja: "{{ A == B }}" - single Jinja block, should be evaluated server-side
+    Jinja+NatLang: "{{ A }} is same as {{ B }}" - multiple Jinja blocks mixed with natural language
+
+    Returns True only for pure Jinja expressions that can be evaluated to boolean server-side.
+    """
+    if not expression:
+        return False
+
+    stripped = expression.strip()
+
+    # Must start with {{ and end with }}
+    if not (stripped.startswith("{{") and stripped.endswith("}}")):
+        return False
+
+    # Count the number of {{ occurrences
+    # If there's more than one, it's Jinja+NatLang (e.g., "{{ A }} is same as {{ B }}")
+    jinja_open_count = stripped.count("{{")
+    if jinja_open_count > 1:
+        return False
+
+    # Single {{ and ends with }} - this is pure Jinja
+    return True
+
+
+def _resolve_nested_path(value: Any, path: str) -> Any:
+    """
+    Resolve a dotted/bracket access path on a nested value.
+
+    Examples:
+        _resolve_nested_path({"a": {"b": 1}}, ".a.b") -> 1
+        _resolve_nested_path([{"x": 2}], "[0].x") -> 2
+
+    Args:
+        value: The root value to traverse
+        path: The access path (e.g., ".field1.field2[0].field3")
+
+    Returns:
+        The resolved leaf value
+
+    Raises:
+        LookupError: If the path cannot be resolved
+    """
+    segments = re.findall(r"\.([a-zA-Z_]\w*)|\[(\d+)\]", path)
+    current = value
+    for dot_key, bracket_idx in segments:
+        if dot_key:
+            if isinstance(current, dict):
+                if dot_key not in current:
+                    raise LookupError(f"Key {dot_key!r} not found")
+                current = current[dot_key]
+            else:
+                raise LookupError(f"Cannot access .{dot_key} on {type(current).__name__}")
+        elif bracket_idx:
+            idx = int(bracket_idx)
+            if isinstance(current, (list, tuple)):
+                if idx >= len(current):
+                    raise LookupError(f"Index [{idx}] out of range")
+                current = current[idx]
+            else:
+                raise LookupError(f"Cannot index [{idx}] on {type(current).__name__}")
+    return current
+
+
+_JINJA_DISPLAY_FILTERS: dict[str, Callable[[Any], Any]] = {
+    "lower": lambda v: str(v).lower(),
+    "upper": lambda v: str(v).upper(),
+    "trim": lambda v: str(v).strip(),
+    "title": lambda v: str(v).title(),
+    "capitalize": lambda v: str(v).capitalize(),
+    "int": lambda v: int(v),
+    "float": lambda v: float(v),
+    "string": lambda v: str(v),
+    "length": lambda v: len(v),
+    "abs": lambda v: abs(v),
+}
+
+
+def _render_jinja_expression_for_display(
+    expression: str,
+    context_values: dict[str, Any],
+    block_label: str | None = None,
+) -> str:
+    """
+    Render a pure Jinja expression for UI display by substituting variable names with values.
+
+    This is for display purposes only - it shows users what values were compared
+    without actually evaluating the expression. For example:
+    - Input: "{{ base_date == date_1 }}" with context {"base_date": "01-25-2026", "date_1": "01-25-2026"}
+    - Output: '"01-25-2026" == "01-25-2026"'
+    - Input: "{{ output.extracted_information.field != None }}" with nested dict context
+    - Output: '"some_value" != None'
+    - Input: "{{ output.status|lower == 'active' }}" with context {"output": {"status": "Active"}}
+    - Output: '"active" == \'active\''
+
+    Known Jinja filters (lower, upper, trim, etc.) are applied to the resolved value.
+    Unknown filters are left as-is in the output.
+
+    Returns the original expression if it's not a pure Jinja expression or if rendering fails.
+    """
+    if not _is_pure_jinja_expression(expression):
+        return expression
+
+    try:
+        # Extract inner expression (strip {{ and }})
+        inner_expr = expression.strip()[2:-2].strip()
+        display_expr = inner_expr
+
+        # Substitute variable references (including dotted/bracket access paths and filters)
+        # with their values.
+        # Match var_name optionally followed by .field or [index] segments,
+        # then optionally followed by a |filter_name.
+        # Sort by key length (longest first) to avoid partial matches.
+        for var_name in sorted(context_values.keys(), key=len, reverse=True):
+            pattern = r"\b" + re.escape(var_name) + r"((?:\.[a-zA-Z_]\w*|\[\d+\])*)(\|[a-zA-Z_]\w*)?"
+
+            def _replacer(match: re.Match, _var_name: str = var_name) -> str:
+                access_path = match.group(1)  # the dotted/bracket part after var_name
+                filter_expr = match.group(2)  # e.g., "|lower" or None
+                var_value = context_values[_var_name]
+
+                if access_path:
+                    try:
+                        var_value = _resolve_nested_path(var_value, access_path)
+                    except LookupError:
+                        # Path couldn't be resolved — return original text unchanged
+                        return match.group(0)
+
+                if filter_expr:
+                    filter_name = filter_expr[1:]  # strip the leading |
+                    filter_fn = _JINJA_DISPLAY_FILTERS.get(filter_name)
+                    if filter_fn is not None:
+                        try:
+                            var_value = filter_fn(var_value)
+                        except Exception:
+                            # Filter application failed — show value with filter text
+                            if isinstance(var_value, str):
+                                return f'"{var_value}"{filter_expr}'
+                            return f"{var_value}{filter_expr}"
+                    else:
+                        # Unknown filter — show value with filter text preserved
+                        if isinstance(var_value, str):
+                            return f'"{var_value}"{filter_expr}'
+                        return f"{var_value}{filter_expr}"
+
+                if isinstance(var_value, str):
+                    return f'"{var_value}"'
+                return str(var_value)
+
+            display_expr = re.sub(pattern, _replacer, display_expr)
+
+        return display_expr
+    except Exception as exc:
+        LOG.debug(
+            "Failed to render Jinja expression for display",
+            block_label=block_label,
+            expression=expression,
+            error=str(exc),
+        )
+        return expression
+
+
+def _find_evaluations_array(output_value: dict[str, Any]) -> list[Any]:
+    """
+    Extract the evaluations array from LLM output.
+
+    ExtractionBlock wraps output in 'extracted_information', so we check there first.
+    Falls back to direct access if not found in the nested structure.
+
+    Args:
+        output_value: The raw output from ExtractionBlock
+
+    Returns:
+        List of evaluation objects from the LLM
+
+    Raises:
+        ValueError: If evaluations array is not found or has wrong type
+    """
+    # Try standard ExtractionBlock format: output_value.extracted_information.evaluations
+    extracted_info = output_value.get("extracted_information")
+    if isinstance(extracted_info, dict):
+        raw_evaluations = extracted_info.get("evaluations")
+    else:
+        # Fallback: try direct access at output_value.evaluations
+        raw_evaluations = output_value.get("evaluations")
+
+    if not isinstance(raw_evaluations, list):
+        raise ValueError(f"Expected array of evaluations, got: {type(raw_evaluations)}")
+
+    return raw_evaluations
+
+
+def _parse_single_evaluation(
+    evaluation: Any,
+    idx: int,
+    fallback_rendered_expressions: list[str],
+) -> tuple[bool, str]:
+    """
+    Parse a single evaluation from the LLM response.
+
+    Handles two formats:
+    - New format (dict): {result: bool, rendered_condition: str, reasoning: str}
+    - Legacy format: just a boolean value
+
+    Args:
+        evaluation: Single evaluation object from LLM (dict or bool)
+        idx: Index of this evaluation (for fallback lookup)
+        fallback_rendered_expressions: Pre-rendered expressions to use if LLM didn't provide one
+
+    Returns:
+        Tuple of (boolean_result, rendered_condition_string)
+    """
+    # Determine fallback rendered expression
+    fallback_rendered = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
+
+    if isinstance(evaluation, dict):
+        # New format: {result, rendered_condition, reasoning}
+        result = evaluation.get("result")
+        if isinstance(result, bool):
+            bool_result = result
+        else:
+            bool_result = _evaluate_truthy_string(str(result))
+            LOG.warning(
+                "Prompt branch evaluation returned non-boolean result",
+                branch_index=idx,
+                result=result,
+                evaluated_result=bool_result,
+            )
+
+        # Get rendered_condition, fallback to pre-rendered expression
+        rendered_cond = evaluation.get("rendered_condition")
+        if rendered_cond and isinstance(rendered_cond, str):
+            rendered_expression = rendered_cond
+        else:
+            rendered_expression = fallback_rendered
+
+        return (bool_result, rendered_expression)
+    else:
+        # Legacy format: just a boolean
+        if isinstance(evaluation, bool):
+            bool_result = evaluation
+        else:
+            bool_result = _evaluate_truthy_string(str(evaluation))
+
+        return (bool_result, fallback_rendered)
+
+
 class BranchCondition(BaseModel):
     """Represents a single conditional branch edge within a ConditionalBlock."""
 
@@ -4534,7 +5371,7 @@ class BranchCondition(BaseModel):
             if criteria_type is None:
                 # Infer criteria type from expression format
                 expression = condition_obj.criteria.get("expression", "")
-                if expression.startswith("{{") and expression.endswith("}}"):
+                if _is_pure_jinja_expression(expression):
                     criteria_type = "jinja2_template"
                 else:
                     criteria_type = "prompt"
@@ -4549,7 +5386,7 @@ class BranchCondition(BaseModel):
         if condition_obj.criteria and isinstance(condition_obj.criteria, BranchCriteria):
             expression = condition_obj.criteria.expression
             criteria_dict = condition_obj.criteria.model_dump()
-            if expression and expression.startswith("{{") and expression.endswith("}}"):
+            if _is_pure_jinja_expression(expression):
                 criteria_dict["criteria_type"] = "jinja2_template"
                 condition_obj.criteria = JinjaBranchCriteria(**criteria_dict)
             else:
@@ -4593,121 +5430,227 @@ class ConditionalBlock(Block):
         workflow_run_id: str,
         workflow_run_block_id: str,
         organization_id: str | None = None,
-    ) -> list[bool]:
+        browser_session_id: str | None = None,
+    ) -> tuple[list[bool], list[str], str | None, dict | None]:
+        """
+        Evaluate natural language branch conditions using a single ExtractionBlock.
+
+        All prompt-based conditions are batched into ONE LLM call for performance.
+        Jinja parts ({{ }}) are pre-rendered before sending to LLM.
+
+        ExtractionBlock provides:
+        - Browser/page access for expressions like "comment count > 100"
+        - UI visibility (shows up in workflow timeline with prompt/response)
+        - Proper LLM integration with data_schema
+
+        Returns:
+            A tuple of (results, rendered_expressions, extraction_goal, llm_response):
+            - results: List of boolean results for each branch
+            - rendered_expressions: List of expressions after Jinja pre-rendering
+            - extraction_goal: The prompt sent to the LLM (for UI display)
+            - llm_response: The raw LLM response for debugging
+        """
         if organization_id is None:
             raise ValueError("organization_id is required to evaluate natural language branches")
 
-        workflow_run_context = evaluation_context.workflow_run_context
-        context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
-        context_snapshot_json = json.dumps(context_snapshot, default=str)
+        if not branches:
+            return ([], [], None, None)
 
-        rendered_branch_criteria: list[dict[str, Any]] = []
+        workflow_run_context = evaluation_context.workflow_run_context
+
+        # Step 1: Pre-render all expressions (resolve any Jinja {{ }} parts)
+        rendered_expressions: list[str] = []
+        has_any_pure_natlang = False
+
         for idx, branch in enumerate(branches):
             expression = branch.criteria.expression if branch.criteria else ""
-            rendered_expression = (
-                evaluation_context.template_renderer(expression) if evaluation_context.template_renderer else expression
+            has_jinja = "{{" in expression
+
+            if has_jinja:
+                try:
+                    rendered_expression = (
+                        evaluation_context.template_renderer(expression)
+                        if evaluation_context.template_renderer
+                        else expression
+                    )
+                except Exception as render_exc:
+                    LOG.error(
+                        "Conditional branch expression rendering FAILED",
+                        block_label=self.label,
+                        branch_index=idx,
+                        original_expression=expression,
+                        error=str(render_exc),
+                        exc_info=True,
+                    )
+                    rendered_expression = expression
+            else:
+                rendered_expression = expression
+                has_any_pure_natlang = True
+
+            LOG.info(
+                "Conditional branch expression rendering",
+                block_label=self.label,
+                branch_index=idx,
+                original_expression=expression,
+                rendered_expression=rendered_expression,
+                has_jinja=has_jinja,
+                expression_changed=expression != rendered_expression,
             )
 
-            rendered_branch_criteria.append({"index": idx, "expression": rendered_expression})
+            rendered_expressions.append(rendered_expression)
 
-        branch_criteria_payload = [
-            {"index": criterion["index"], "expression": criterion["expression"]}
-            for criterion in rendered_branch_criteria
-        ]
+        # Step 2: Build extraction goal with all conditions
+        # Include context only if there are pure NatLang expressions that need variable resolution
+        if has_any_pure_natlang:
+            context_snapshot = evaluation_context.build_llm_safe_context_snapshot()
+            context_json = json.dumps(context_snapshot, default=str)
+        else:
+            context_json = None
 
         extraction_goal = prompt_engine.load_prompt(
             "conditional-prompt-branch-evaluation",
-            branch_criteria=branch_criteria_payload,
-            context_snapshot=context_snapshot_json,
+            conditions=rendered_expressions,
+            context_json=context_json,
         )
 
+        # Step 3: Build schema for array of evaluation results
+        # Order matters: rendered_condition -> reasoning -> result (chain-of-thought)
         data_schema = {
             "type": "object",
             "properties": {
-                "branch_results": {
+                "evaluations": {
                     "type": "array",
-                    "description": "Boolean results for each natural language branch in order.",
-                    "items": {"type": "boolean"},
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "rendered_condition": {
+                                "type": "string",
+                                "description": (
+                                    "The condition with all variable names and references replaced with actual values."
+                                ),
+                            },
+                            "reasoning": {
+                                "type": "string",
+                                "description": "Explanation of the reasoning behind evaluating the rendered condition.",
+                            },
+                            "result": {
+                                "type": "boolean",
+                                "description": "TRUE if the rendered condition is satisfied, FALSE otherwise.",
+                            },
+                        },
+                        "required": ["rendered_condition", "reasoning", "result"],
+                    },
+                    "description": "Array of evaluation results for each condition in the same order.",
+                    "minItems": len(branches),
+                    "maxItems": len(branches),
                 }
             },
-            "required": ["branch_results"],
+            "required": ["evaluations"],
         }
 
+        # Step 4: Create and execute single ExtractionBlock
         output_param = OutputParameter(
             output_parameter_id=str(uuid.uuid4()),
-            key=f"prompt_branch_eval_{generate_random_string()}",
+            key=f"conditional_branch_eval_{generate_random_string()}",
             workflow_id=self.output_parameter.workflow_id,
             created_at=datetime.now(),
             modified_at=datetime.now(),
             parameter_type=ParameterType.OUTPUT,
-            description="Prompt branch evaluation result",
+            description=f"Conditional branch evaluation results ({len(branches)} conditions)",
         )
 
         extraction_block = ExtractionBlock(
-            label=f"prompt_branch_eval_{generate_random_string()}",
+            label=f"conditional_branch_eval_{generate_random_string()}",
             data_extraction_goal=extraction_goal,
             data_schema=data_schema,
             output_parameter=output_param,
         )
 
-        extraction_result = await extraction_block.execute(
-            workflow_run_id=workflow_run_id,
-            workflow_run_block_id=workflow_run_block_id,
-            organization_id=organization_id,
+        LOG.info(
+            "Conditional branch ExtractionBlock created (batched)",
+            block_label=self.label,
+            num_conditions=len(branches),
+            extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+            has_browser_session=browser_session_id is not None,
+            has_context=context_json is not None,
         )
 
-        if not extraction_result.success:
-            raise ValueError(f"Prompt branch evaluation failed: {extraction_result.failure_reason}")
-
-        output_value = extraction_result.output_parameter_value
-        if workflow_run_context:
-            try:
-                await extraction_block.record_output_parameter_value(
-                    workflow_run_context=workflow_run_context,
-                    workflow_run_id=workflow_run_id,
-                    value=output_value,
-                )
-            except Exception:
-                LOG.warning(
-                    "Failed to record prompt branch evaluation output",
-                    workflow_run_id=workflow_run_id,
-                    block_label=self.label,
-                    exc_info=True,
-                )
-
-        extracted_info: Any | None = None
-        if isinstance(output_value, dict):
-            extracted_info = output_value.get("extracted_information")
-
-        if isinstance(extracted_info, list) and len(extracted_info) == 1:
-            extracted_info = extracted_info[0]
-
-        if not isinstance(extracted_info, dict):
-            raise ValueError("Prompt branch evaluation returned no extracted_information payload")
-
-        branch_results_raw = extracted_info.get("branch_results")
-        if not isinstance(branch_results_raw, list):
-            raise ValueError("Prompt branch evaluation did not return branch_results list")
-
-        branch_results: list[bool] = []
-        for result in branch_results_raw:
-            if isinstance(result, bool):
-                branch_results.append(result)
-            else:
-                evaluated_result = _evaluate_truthy_string(str(result))
-                LOG.warning(
-                    "Prompt branch evaluation returned non-boolean result",
-                    result=result,
-                    evaluated_result=evaluated_result,
-                )
-                branch_results.append(evaluated_result)
-
-        if len(branch_results) != len(branches):
-            raise ValueError(
-                f"Prompt branch evaluation returned {len(branch_results)} results for {len(branches)} branches"
+        try:
+            extraction_result = await extraction_block.execute(
+                workflow_run_id=workflow_run_id,
+                workflow_run_block_id=workflow_run_block_id,
+                organization_id=organization_id,
+                browser_session_id=browser_session_id,
             )
 
-        return branch_results
+            if not extraction_result.success:
+                LOG.error(
+                    "Conditional branch ExtractionBlock failed",
+                    block_label=self.label,
+                    failure_reason=extraction_result.failure_reason,
+                )
+                raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+
+            # Record output parameter value if workflow context available
+            if workflow_run_context:
+                try:
+                    await extraction_block.record_output_parameter_value(
+                        workflow_run_context=workflow_run_context,
+                        workflow_run_id=workflow_run_id,
+                        value=extraction_result.output_parameter_value,
+                    )
+                except Exception:
+                    LOG.warning(
+                        "Failed to record conditional branch evaluation output",
+                        workflow_run_id=workflow_run_id,
+                        block_label=self.label,
+                        exc_info=True,
+                    )
+
+            # Step 5: Extract the evaluation results (result + rendered_condition)
+            output_value = extraction_result.output_parameter_value
+            results_array: list[bool] = []
+            llm_rendered_expressions: list[str] = []
+
+            if not isinstance(output_value, dict):
+                raise ValueError(f"Unexpected output format: {type(output_value)}")
+
+            # Find evaluations array from LLM output (handles ExtractionBlock nesting)
+            raw_evaluations = _find_evaluations_array(output_value)
+
+            # Parse each evaluation to extract result and rendered_condition
+            for idx, evaluation in enumerate(raw_evaluations):
+                bool_result, rendered_expr = _parse_single_evaluation(
+                    evaluation=evaluation,
+                    idx=idx,
+                    fallback_rendered_expressions=rendered_expressions,
+                )
+                results_array.append(bool_result)
+                llm_rendered_expressions.append(rendered_expr)
+
+            LOG.info(
+                "Conditional branch evaluation results",
+                block_label=self.label,
+                results=results_array,
+                llm_rendered_expressions=llm_rendered_expressions,
+                raw_output=output_value,
+            )
+
+            if len(results_array) != len(branches):
+                raise ValueError(
+                    f"Prompt branch evaluation returned {len(results_array)} results for {len(branches)} branches"
+                )
+
+            return (results_array, llm_rendered_expressions, extraction_goal, output_value)
+
+        except Exception as exc:
+            LOG.error(
+                "Conditional branch ExtractionBlock execution failed",
+                block_label=self.label,
+                error=str(exc),
+                exc_info=True,
+            )
+            raise ValueError(f"Prompt branch evaluation failed: {str(exc)}") from exc
 
     async def execute(  # noqa: D401
         self,
@@ -4739,21 +5682,37 @@ class ConditionalBlock(Block):
         matched_branch = None
         failure_reason: str | None = None
 
+        # Track all branch evaluations for UI display
+        branch_evaluations_list: list[dict] = []
+        prompt_rendered_by_id: dict[str, str] = {}
+
         natural_language_branches = [
             branch for branch in self.ordered_branches if isinstance(branch.criteria, PromptBranchCriteria)
         ]
         prompt_results_by_id: dict[str, bool] = {}
+        prompt_llm_response: dict | None = None
+        prompt_extraction_goal: str | None = None
         if natural_language_branches:
             try:
-                prompt_results = await self._evaluate_prompt_branches(
+                (
+                    prompt_results,
+                    prompt_rendered_expressions,
+                    prompt_extraction_goal,
+                    prompt_llm_response,
+                ) = await self._evaluate_prompt_branches(
                     branches=natural_language_branches,
                     evaluation_context=evaluation_context,
                     workflow_run_id=workflow_run_id,
                     workflow_run_block_id=workflow_run_block_id,
                     organization_id=organization_id,
+                    browser_session_id=browser_session_id,
                 )
                 prompt_results_by_id = {
                     branch.id: result for branch, result in zip(natural_language_branches, prompt_results, strict=False)
+                }
+                prompt_rendered_by_id = {
+                    branch.id: rendered
+                    for branch, rendered in zip(natural_language_branches, prompt_rendered_expressions, strict=False)
                 }
             except Exception as exc:
                 failure_reason = f"Failed to evaluate natural language branches: {str(exc)}"
@@ -4765,24 +5724,49 @@ class ConditionalBlock(Block):
                 )
 
         for idx, branch in enumerate(self.ordered_branches):
+            branch_eval: dict = {
+                "branch_id": branch.id,
+                "branch_index": idx,
+                "criteria_type": branch.criteria.criteria_type if branch.criteria else None,
+                "original_expression": branch.criteria.expression if branch.criteria else None,
+                "rendered_expression": None,
+                "result": None,
+                "is_matched": False,
+                "is_default": branch.is_default,
+                "next_block_label": branch.next_block_label,
+                "error": None,
+            }
+
+            # Handle default branch (no criteria to evaluate)
             if branch.criteria is None:
+                # Default branch - only matched if no other branch matches
+                branch_evaluations_list.append(branch_eval)
                 continue
 
             if branch.criteria.criteria_type == "prompt":
                 if failure_reason:
+                    branch_eval["error"] = failure_reason
+                    branch_evaluations_list.append(branch_eval)
                     break
                 prompt_result = prompt_results_by_id.get(branch.id)
+                rendered_expr = prompt_rendered_by_id.get(branch.id)
+                branch_eval["rendered_expression"] = rendered_expr
                 if prompt_result is None:
                     failure_reason = "Missing result for natural language branch evaluation"
+                    branch_eval["error"] = failure_reason
                     LOG.error(
                         "Missing prompt evaluation result",
                         block_label=self.label,
                         branch_index=idx,
                         branch_id=branch.id,
                     )
+                    branch_evaluations_list.append(branch_eval)
                     break
+                branch_eval["result"] = prompt_result
+                branch_evaluations_list.append(branch_eval)
                 if prompt_result:
                     matched_branch = branch
+                    branch_eval["is_matched"] = True
                     LOG.info(
                         "Conditional natural language branch matched",
                         block_label=self.label,
@@ -4792,9 +5776,25 @@ class ConditionalBlock(Block):
                     break
                 continue
 
+            # Jinja template branch
             try:
-                if await branch.criteria.evaluate(evaluation_context):
+                # Render the expression for UI display - substitute variables without evaluating
+                rendered_expression = _render_jinja_expression_for_display(
+                    expression=branch.criteria.expression,
+                    context_values=evaluation_context.workflow_run_context.values
+                    if evaluation_context.workflow_run_context
+                    else {},
+                    block_label=self.label,
+                )
+                branch_eval["rendered_expression"] = rendered_expression
+
+                result = await branch.criteria.evaluate(evaluation_context)
+                branch_eval["result"] = result
+                branch_evaluations_list.append(branch_eval)
+
+                if result:
                     matched_branch = branch
+                    branch_eval["is_matched"] = True
                     LOG.info(
                         "Conditional branch matched",
                         block_label=self.label,
@@ -4804,6 +5804,9 @@ class ConditionalBlock(Block):
                     break
             except Exception as exc:
                 failure_reason = f"Failed to evaluate branch {idx} for {self.label}: {str(exc)}"
+                branch_eval["error"] = str(exc)
+                branch_eval["result"] = None
+                branch_evaluations_list.append(branch_eval)
                 LOG.error(
                     "Failed to evaluate conditional branch",
                     block_label=self.label,
@@ -4815,6 +5818,12 @@ class ConditionalBlock(Block):
 
         if matched_branch is None and failure_reason is None:
             matched_branch = self.get_default_branch()
+            # Update is_matched for default branch in evaluations
+            if matched_branch:
+                for eval_entry in branch_evaluations_list:
+                    if eval_entry["branch_id"] == matched_branch.id:
+                        eval_entry["is_matched"] = True
+                        break
 
         matched_index = self.ordered_branches.index(matched_branch) if matched_branch in self.ordered_branches else None
         next_block_label = matched_branch.next_block_label if matched_branch else None
@@ -4848,6 +5857,20 @@ class ConditionalBlock(Block):
             if matched_branch and matched_branch.criteria
             else None,
             "next_block_label": next_block_label,
+            # Detailed evaluation info for all branches
+            "evaluations": branch_evaluations_list if branch_evaluations_list else None,
+            # Raw LLM response for debugging prompt-based evaluations (masked for secrets)
+            "llm_response": (
+                workflow_run_context.mask_secrets_in_data(prompt_llm_response)
+                if workflow_run_context and prompt_llm_response
+                else prompt_llm_response
+            ),
+            # The exact prompt sent to LLM for debugging (masked for secrets)
+            "llm_prompt": (
+                workflow_run_context.mask_secrets_in_data(prompt_extraction_goal)
+                if workflow_run_context and prompt_extraction_goal
+                else prompt_extraction_goal
+            ),
         }
 
         status = BlockStatus.completed
@@ -4944,6 +5967,7 @@ BlockSubclasses = Union[
     TaskV2Block,
     FileUploadBlock,
     HttpRequestBlock,
+    PrintPageBlock,
 ]
 BlockTypeVar = Annotated[BlockSubclasses, Field(discriminator="block_type")]
 

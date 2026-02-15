@@ -12,6 +12,16 @@ LOG = structlog.get_logger()
 T = TypeVar("T", bound="Action")
 
 
+class CaptchaType(StrEnum):
+    TEXT_CAPTCHA = "text_captcha"
+    RECAPTCHA = "recaptcha"
+    HCAPTCHA = "hcaptcha"
+    MTCAPTCHA = "mtcaptcha"
+    FUNCAPTCHA = "funcaptcha"
+    CLOUDFLARE = "cloudflare"
+    OTHER = "other"
+
+
 class ActionStatus(StrEnum):
     pending = "pending"
     skipped = "skipped"
@@ -82,9 +92,10 @@ class InputOrSelectContext(BaseModel):
     is_location_input: bool | None = None  # address input usually requires auto completion
     is_date_related: bool | None = None  # date picker mini agent requires some special logic
     date_format: str | None = None
+    is_text_captcha: bool | None = None
 
     def __repr__(self) -> str:
-        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, intention={self.intention})"
+        return f"InputOrSelectContext(field={self.field}, is_required={self.is_required}, is_search_bar={self.is_search_bar}, is_location_input={self.is_location_input}, is_date_related={self.is_date_related}, date_format={self.date_format}, is_text_captcha={self.is_text_captcha}, intention={self.intention})"
 
 
 class ClickContext(BaseModel):
@@ -113,6 +124,7 @@ class Action(BaseModel):
     element_id: Annotated[str, Field(coerce_numbers_to_str=True)] | None = None
     skyvern_element_hash: str | None = None
     skyvern_element_data: dict[str, Any] | None = None
+    screenshot_artifact_id: str | None = None
     tool_call_id: str | None = None
     xpath: str | None = None
 
@@ -124,6 +136,8 @@ class Action(BaseModel):
     file_name: str | None = None
     file_url: str | None = None
     download: bool | None = None
+    download_triggered: bool | None = None  # Whether a download was triggered by this action
+    downloaded_files: list[str] | None = None  # List of file names downloaded by this action
     is_upload_file_tag: bool | None = None
     text: str | None = None
     input_or_select_context: InputOrSelectContext | None = None
@@ -137,6 +151,11 @@ class Action(BaseModel):
 
     # flag indicating whether the action requires mini-agent mode
     has_mini_agent: bool | None = None
+
+    # When True, the auto-completion Tab hack is skipped because a follow-up
+    # action in the same batch targets the same element or presses a key (e.g. Enter).
+    # Pressing Tab would move focus away and break that next action.
+    skip_auto_complete_tab: bool = False
 
     created_at: datetime | None = None
     modified_at: datetime | None = None
@@ -249,6 +268,7 @@ class UploadFileAction(WebAction):
 # This action is deprecated in 'extract-actions' prompt. Only used for the download action triggered by the code.
 class DownloadFileAction(Action):
     action_type: ActionType = ActionType.DOWNLOAD_FILE
+    download: bool = True
     file_name: str
     byte: Annotated[bytes | None, Field(exclude=True)] = None  # bytes data
     download_url: str | None = None  # URL to download file from
@@ -263,6 +283,7 @@ class NullAction(Action):
 
 class SolveCaptchaAction(Action):
     action_type: ActionType = ActionType.SOLVE_CAPTCHA
+    captcha_type: CaptchaType | None = None
 
 
 class SelectOptionAction(WebAction):

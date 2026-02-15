@@ -2,7 +2,6 @@ import asyncio
 import copy
 import json
 import os
-import shutil
 import time
 import urllib.parse
 import uuid
@@ -26,8 +25,6 @@ from skyvern.constants import (
 )
 from skyvern.errors.errors import TOTPExpiredError
 from skyvern.exceptions import (
-    DownloadedFileNotFound,
-    DownloadFileMaxWaitingTime,
     EmptySelect,
     ErrEmptyTweakValue,
     ErrFoundSelectableElement,
@@ -39,6 +36,7 @@ from skyvern.exceptions import (
     FailToSelectByValue,
     IllegitComplete,
     ImaginaryFileUrl,
+    ImaginarySecretValue,
     InputToInvisibleElement,
     InputToReadonlyElement,
     InteractWithDisabledElement,
@@ -61,12 +59,10 @@ from skyvern.exceptions import (
 from skyvern.experimentation.wait_utils import get_or_create_wait_config, get_wait_time
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
-from skyvern.forge.sdk.api.files import download_file as download_file_api
 from skyvern.forge.sdk.api.files import (
+    check_downloading_files_and_wait_for_download_to_complete,
     get_download_dir,
-    list_downloading_files_in_directory,
     list_files_in_directory,
-    wait_for_download_finished,
 )
 from skyvern.forge.sdk.api.llm.api_handler_factory import LLMAPIHandlerFactory, LLMCallerManager
 from skyvern.forge.sdk.api.llm.exceptions import LLMProviderError
@@ -78,7 +74,7 @@ from skyvern.forge.sdk.models import Step
 from skyvern.forge.sdk.schemas.tasks import Task
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.services import service_utils
 from skyvern.services.action_service import get_action_history
 from skyvern.utils.prompt_engine import (
@@ -94,6 +90,7 @@ from skyvern.webeye.actions.actions import (
     CheckboxAction,
     ClickAction,
     CompleteVerifyResult,
+    DownloadFileAction,
     InputOrSelectContext,
     InputTextAction,
     ScrapeResult,
@@ -390,7 +387,7 @@ class ActionHandler:
         cls._teardown_action_types[action_type] = handler
 
     @staticmethod
-    @TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+    @traced()
     async def handle_action(
         scraped_page: ScrapedPage,
         task: Task,
@@ -400,7 +397,9 @@ class ActionHandler:
     ) -> list[ActionResult]:
         browser_state = app.BROWSER_MANAGER.get_for_task(task.task_id, workflow_run_id=task.workflow_run_id)
         # TODO: maybe support all action types in the future(?)
-        trigger_download_action = isinstance(action, (SelectOptionAction, ClickAction)) and action.download
+        trigger_download_action = (
+            isinstance(action, (SelectOptionAction, ClickAction, DownloadFileAction)) and action.download
+        )
         if not trigger_download_action:
             results = await ActionHandler._handle_action(
                 scraped_page=scraped_page,
@@ -409,7 +408,8 @@ class ActionHandler:
                 page=page,
                 action=action,
             )
-            await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.create_action(action=action)
+            action.action_id = persisted_action.action_id
             return results
 
         context = skyvern_context.current()
@@ -479,35 +479,30 @@ class ActionHandler:
 
             if not download_triggered:
                 results[-1].download_triggered = False
+                action.download_triggered = False
                 return results
             results[-1].download_triggered = True
+            action.download_triggered = True
 
-            # check if there's any file is still downloading
-            downloading_files = list_downloading_files_in_directory(download_dir)
-            if task.browser_session_id:
-                files_in_browser_session = await app.STORAGE.list_downloading_files_in_browser_session(
-                    organization_id=task.organization_id, browser_session_id=task.browser_session_id
-                )
-                downloading_files = downloading_files + files_in_browser_session
-
-            if len(downloading_files) == 0:
-                return results
-
-            LOG.info(
-                "File downloading hasn't completed, wait for a while",
-                downloading_files=downloading_files,
-                workflow_run_id=task.workflow_run_id,
+            await check_downloading_files_and_wait_for_download_to_complete(
+                download_dir=download_dir,
+                organization_id=task.organization_id,
+                browser_session_id=task.browser_session_id,
+                timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT,
             )
-            try:
-                await wait_for_download_finished(
-                    downloading_files=downloading_files, timeout=task.download_timeout or BROWSER_DOWNLOAD_TIMEOUT
-                )
-            except DownloadFileMaxWaitingTime as e:
-                LOG.warning(
-                    "There're several long-time downloading files, these files might be broken",
-                    downloading_files=e.downloading_files,
+
+            # Calculate newly downloaded file names
+            new_file_paths = set(list_files_after) - set(list_files_before)
+            downloaded_file_names = [os.path.basename(fp) for fp in new_file_paths]
+            if downloaded_file_names:
+                results[-1].downloaded_files = downloaded_file_names
+                action.downloaded_files = downloaded_file_names
+                LOG.info(
+                    "Downloaded files captured",
+                    downloaded_files=downloaded_file_names,
                     workflow_run_id=task.workflow_run_id,
                 )
+
             return results
         finally:
             if browser_state is not None and download_triggered:
@@ -529,7 +524,8 @@ class ActionHandler:
                     # close the extra page
                     await pages_after_download[-1].close()
 
-            await app.DATABASE.create_action(action=action)
+            persisted_action = await app.DATABASE.create_action(action=action)
+            action.action_id = persisted_action.action_id
 
     @staticmethod
     async def _handle_action(
@@ -593,6 +589,9 @@ class ActionHandler:
         except LLMProviderError as e:
             LOG.exception("LLM error in action handler", action=action, exc_info=True)
             actions_result.append(ActionFailure(e))
+        except ImaginarySecretValue as e:
+            LOG.exception("Imaginary secret value", action=action, exc_info=True)
+            actions_result.append(ActionFailure(e))
         except Exception as e:
             LOG.exception("Unhandled exception in action handler", action=action)
             actions_result.append(ActionFailure(e))
@@ -642,7 +641,7 @@ def check_for_invalid_web_action(
     return []
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_solve_captcha_action(
     action: actions.SolveCaptchaAction,
     page: Page,
@@ -658,7 +657,7 @@ async def handle_solve_captcha_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_click_action(
     action: actions.ClickAction,
     page: Page,
@@ -781,6 +780,7 @@ async def handle_click_action(
                     anchor_element=skyvern_element,
                     dom=dom,
                     page=page,
+                    skyvern_frame=skyvern_frame,
                     scraped_page=scraped_page,
                     incremental_scraped=incremental_scraped,
                     task=task,
@@ -804,19 +804,25 @@ async def handle_click_action(
     return results
 
 
-@TraceManager.traced_async(ignore_inputs=["anchor_element", "scraped_page", "page", "incremental_scraped", "dom"])
+@traced()
 async def handle_sequential_click_for_dropdown(
     action: actions.ClickAction,
     action_history: list[ActionResult],
     anchor_element: SkyvernElement,
     dom: DomUtil,
     page: Page,
+    skyvern_frame: SkyvernFrame,
     scraped_page: ScrapedPage,
     incremental_scraped: IncrementalScrapePage,
     task: Task,
     step: Step,
 ) -> ActionResult | None:
     if await incremental_scraped.get_incremental_elements_num() == 0:
+        return None
+
+    await skyvern_frame.safe_wait_for_animation_end()
+    if page.url != scraped_page.url:
+        LOG.info("Page URL changed after clicking, exiting the sequential click logic")
         return None
 
     incremental_elements = await incremental_scraped.get_incremental_element_tree(
@@ -838,6 +844,10 @@ async def handle_sequential_click_for_dropdown(
         for element_id in new_element_ids
         if (await dom_after_open.get_skyvern_element_by_id(element_id)).is_interactable()
     ]
+
+    if len(new_interactable_element_ids) == 0:
+        LOG.info("No new interactable elements found, exiting the sequential click logic")
+        return None
 
     action_history_str = ""
     if action_history and len(action_history) > 0:
@@ -920,7 +930,7 @@ async def handle_sequential_click_for_dropdown(
     )
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_click_to_download_file_action(
     action: actions.ClickAction,
     page: Page,
@@ -1064,7 +1074,7 @@ async def _handle_multi_field_totp_sequence(
     return None  # Success
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_input_text_action(
     action: actions.InputTextAction,
     page: Page,
@@ -1502,7 +1512,12 @@ async def handle_input_text_action(
         raise e
     finally:
         # HACK: force to finish missing auto completion input
-        if auto_complete_hacky_flag and await skyvern_element.is_visible() and not await skyvern_element.is_raw_input():
+        if (
+            auto_complete_hacky_flag
+            and await skyvern_element.is_visible()
+            and not await skyvern_element.is_raw_input()
+            and not action.skip_auto_complete_tab
+        ):
             LOG.debug(
                 "Trigger input-selection hack, pressing Tab to choose one",
                 action=action,
@@ -1510,7 +1525,7 @@ async def handle_input_text_action(
             await skyvern_element.press_key("Tab")
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_upload_file_action(
     action: actions.UploadFileAction,
     page: Page,
@@ -1596,7 +1611,7 @@ async def handle_upload_file_action(
 
 # This function is deprecated in 'extract-actions' prompt. Downloads are handled by the click action handler now.
 # Currently, it's only used for the download action triggered by the code.
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_download_file_action(
     action: actions.DownloadFileAction,
     page: Page,
@@ -1620,35 +1635,20 @@ async def handle_download_file_action(
                 full_file_path=full_file_path,
                 file_size=len(action.byte),
             )
-            return [ActionSuccess(download_triggered=True)]
+            return [ActionSuccess()]
 
         # Priority 2: If download_url is provided, download from URL
         if action.download_url is not None:
-            downloaded_path = await download_file_api(action.download_url)
-            # Check if the downloaded file actually exists
-            if not os.path.exists(downloaded_path):
-                LOG.error(
-                    "DownloadFileAction: Downloaded file path does not exist",
-                    action=action,
-                    downloaded_path=downloaded_path,
-                    download_url=action.download_url,
-                    full_file_path=full_file_path,
-                )
-                return [ActionFailure(DownloadedFileNotFound(downloaded_path, action.download_url))]
-
-            # Move the downloaded file to the target location
-            # If the downloaded file has a different name, use it; otherwise use the specified file_name
-            if os.path.basename(downloaded_path) != file_name:
-                # Copy to target location with specified file_name
-                shutil.copy2(downloaded_path, full_file_path)
-                # Optionally remove the temporary file
-                try:
-                    os.remove(downloaded_path)
-                except Exception:
-                    pass  # Ignore errors when removing temp file
-            else:
-                # Move to target location
-                shutil.move(downloaded_path, full_file_path)
+            # the URL is usally requiring login credentials/cookides, so we should use browser navigation to access the URL instead of downloading the file directly
+            try:
+                await page.goto(action.download_url, timeout=settings.BROWSER_LOADING_TIMEOUT_MS)
+            except Exception as e:
+                error = str(e)
+                # some cases use this method to download a file. but it will be redirected away soon
+                # and agent will run into ABORTED error.
+                # some cases playwright will raise error like "Page.goto: Download is starting"
+                if "net::ERR_ABORTED" not in error and "Page.goto: Download is starting" not in error:
+                    raise e
 
             LOG.info(
                 "DownloadFileAction: Downloaded file from URL",
@@ -1656,9 +1656,9 @@ async def handle_download_file_action(
                 full_file_path=full_file_path,
                 download_url=action.download_url,
             )
-            return [ActionSuccess(download_triggered=True)]
+            return [ActionSuccess()]
 
-        return [ActionSuccess(download_triggered=False)]
+        return [ActionSuccess()]
 
     except Exception as e:
         LOG.exception(
@@ -1671,7 +1671,7 @@ async def handle_download_file_action(
         return [ActionFailure(e)]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_null_action(
     action: actions.NullAction,
     page: Page,
@@ -1682,7 +1682,7 @@ async def handle_null_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_select_option_action(
     action: actions.SelectOptionAction,
     page: Page,
@@ -2002,7 +2002,7 @@ async def handle_select_option_action(
         await incremental_scraped.stop_listen_dom_increment()
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_checkbox_action(
     action: actions.CheckboxAction,
     page: Page,
@@ -2031,7 +2031,7 @@ async def handle_checkbox_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_wait_action(
     action: actions.WaitAction,
     page: Page,
@@ -2043,7 +2043,7 @@ async def handle_wait_action(
     return [ActionFailure(exception=Exception("Wait action is treated as a failure"))]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_hover_action(
     action: actions.HoverAction,
     page: Page,
@@ -2081,7 +2081,7 @@ async def handle_hover_action(
         return [ActionFailure(FailToHover(skyvern_element.get_id(), msg=str(exc)))]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_terminate_action(
     action: actions.TerminateAction,
     page: Page,
@@ -2096,7 +2096,7 @@ async def handle_terminate_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_complete_action(
     action: actions.CompleteAction,
     page: Page,
@@ -2155,7 +2155,7 @@ async def handle_complete_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_extract_action(
     action: actions.ExtractAction,
     page: Page,
@@ -2177,7 +2177,7 @@ async def handle_extract_action(
         return [ActionFailure(exception=Exception("No data extraction goal"))]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_scroll_action(
     action: actions.ScrollAction,
     page: Page,
@@ -2185,13 +2185,44 @@ async def handle_scroll_action(
     task: Task,
     step: Step,
 ) -> list[ActionResult]:
-    if action.x and action.y:
+    if action.element_id:
+        # Element-based scrolling from extract-action prompt. Uses
+        # scrollNearestScrollableContainer() from domUtils.js which walks the DOM to find
+        # the nearest scrollable ancestor or sibling container relative to the element.
+        scroll_direction = "down" if action.scroll_y >= 0 else "up"
+        scrolled = False
+        dom = DomUtil(scraped_page=scraped_page, page=page)
+        skyvern_element = await dom.safe_get_skyvern_element_by_id(action.element_id)
+        if skyvern_element:
+            try:
+                scrolled = await skyvern_element.locator.evaluate(
+                    "(el, direction) => scrollNearestScrollableContainer(el, direction)",
+                    scroll_direction,
+                )
+            except Exception:
+                LOG.warning(
+                    "JavaScript scroll evaluation failed, falling back to mouse wheel",
+                    element_id=action.element_id,
+                    exc_info=True,
+                )
+        else:
+            LOG.warning("Could not resolve element for scroll action", element_id=action.element_id)
+        if not scrolled:
+            LOG.warning(
+                "Could not find scrollable container near element, falling back to mouse wheel",
+                element_id=action.element_id,
+            )
+            await page.mouse.wheel(action.scroll_x, action.scroll_y)
+    elif action.x and action.y:
+        # Coordinate-based scrolling from CUA/UI-TARS agents
         await page.mouse.move(action.x, action.y)
-    await page.mouse.wheel(action.scroll_x, action.scroll_y)
+        await page.mouse.wheel(action.scroll_x, action.scroll_y)
+    else:
+        await page.mouse.wheel(action.scroll_x, action.scroll_y)
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_keypress_action(
     action: actions.KeypressAction,
     page: Page,
@@ -2203,7 +2234,7 @@ async def handle_keypress_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_move_action(
     action: actions.MoveAction,
     page: Page,
@@ -2215,7 +2246,7 @@ async def handle_move_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_drag_action(
     action: actions.DragAction,
     page: Page,
@@ -2227,7 +2258,7 @@ async def handle_drag_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_verification_code_action(
     action: actions.VerificationCodeAction,
     page: Page,
@@ -2244,7 +2275,7 @@ async def handle_verification_code_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_left_mouse_action(
     action: actions.LeftMouseAction,
     page: Page,
@@ -2256,7 +2287,7 @@ async def handle_left_mouse_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_goto_url_action(
     action: actions.GotoUrlAction,
     page: Page,
@@ -2268,7 +2299,7 @@ async def handle_goto_url_action(
     return [ActionSuccess()]
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def handle_close_page_action(
     action: actions.ClosePageAction,
     page: Page,
@@ -2544,7 +2575,7 @@ async def chain_click(
             return [ActionFailure(WrongElementToUploadFile(action.element_id))]
 
 
-@TraceManager.traced_async(ignore_inputs=["context", "page", "dom", "text", "skyvern_element", "preserved_elements"])
+@traced()
 async def choose_auto_completion_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -2556,6 +2587,7 @@ async def choose_auto_completion_dropdown(
     task: Task,
     preserved_elements: list[dict] | None = None,
     relevance_threshold: float = 0.8,
+    is_location_input: bool = False,
 ) -> AutoCompletionResult:
     preserved_elements = preserved_elements or []
     clear_input = True
@@ -2611,6 +2643,34 @@ async def choose_auto_completion_dropdown(
         new_interactable_element_ids = []
         if len(incremental_element) > 0:
             cleaned_incremental_element = remove_duplicated_HTML_element(incremental_element)
+
+            # Fast path for location inputs: if exactly one option appeared and it contains
+            # what the user typed, click it directly without an LLM call.
+            if is_location_input and len(cleaned_incremental_element) == 1:
+                only_element = cleaned_incremental_element[0]
+                fast_path_element_id = only_element.get("id", "")
+                # Normalize whitespace for comparison (handles double spaces, etc.)
+                option_text = " ".join((only_element.get("text") or "").lower().split())
+                input_normalized = " ".join(text.lower().split())
+                if fast_path_element_id and input_normalized and input_normalized in option_text:
+                    fast_path_locator = current_frame.locator(f'[{SKYVERN_ID_ATTR}="{fast_path_element_id}"]')
+                    if await fast_path_locator.count() > 0:
+                        LOG.info(
+                            "Location auto-completion fast path: single option found, skipping LLM",
+                            element_id=fast_path_element_id,
+                            input_value=text,
+                        )
+                        try:
+                            await fast_path_locator.click(timeout=settings.BROWSER_ACTION_TIMEOUT_MS)
+                            clear_input = False
+                            result.action_result = ActionSuccess()
+                            return result
+                        except Exception:
+                            LOG.info(
+                                "Location fast-path click failed, falling through to LLM",
+                                element_id=fast_path_element_id,
+                            )
+
             html = incremental_scraped.build_html_tree(cleaned_incremental_element)
         else:
             scraped_page_after_open = await scraped_page.generate_scraped_page_without_screenshots()
@@ -2658,6 +2718,7 @@ async def choose_auto_completion_dropdown(
                 value=text,
             )
             await skyvern_element.press_key("Enter")
+            clear_input = False
             return result
 
         if not element_id:
@@ -2752,6 +2813,7 @@ async def input_or_auto_complete_input(
             "Try the potential value for auto completion",
             input_value=current_value,
         )
+        is_location = input_or_select_context.is_location_input or False
         result = await choose_auto_completion_dropdown(
             context=input_or_select_context,
             page=page,
@@ -2762,6 +2824,7 @@ async def input_or_auto_complete_input(
             skyvern_element=skyvern_element,
             step=step,
             task=task,
+            is_location_input=is_location,
         )
         if isinstance(result.action_result, ActionSuccess):
             return ActionSuccess()
@@ -2824,6 +2887,7 @@ async def input_or_auto_complete_input(
                 skyvern_element=skyvern_element,
                 step=step,
                 task=task,
+                is_location_input=is_location,
             )
             if isinstance(result.action_result, ActionSuccess):
                 return ActionSuccess()
@@ -2872,19 +2936,7 @@ async def input_or_auto_complete_input(
         return None
 
 
-@TraceManager.traced_async(
-    ignore_inputs=[
-        "input_or_select_context",
-        "page",
-        "dom",
-        "skyvern_element",
-        "skyvern_frame",
-        "incremental_scraped",
-        "dropdown_menu_element",
-        "target_value",
-        "continue_until_close",
-    ]
-)
+@traced()
 async def sequentially_select_from_dropdown(
     action: SelectOptionAction,
     input_or_select_context: InputOrSelectContext,
@@ -3064,7 +3116,7 @@ class CustomSelectPromptOptions(BaseModel):
     target_value: str | None = None
 
 
-@TraceManager.traced_async(ignore_inputs=["scraped_page", "page"])
+@traced()
 async def select_from_emerging_elements(
     current_element_id: str,
     options: CustomSelectPromptOptions,
@@ -3157,19 +3209,7 @@ async def select_from_emerging_elements(
     return ActionSuccess()
 
 
-@TraceManager.traced_async(
-    ignore_inputs=[
-        "context",
-        "page",
-        "skyvern_element",
-        "skyvern_frame",
-        "incremental_scraped",
-        "check_filter_funcs",
-        "dropdown_menu_element",
-        "select_history",
-        "target_value",
-    ]
-)
+@traced()
 async def select_from_dropdown(
     context: InputOrSelectContext,
     page: Page,
@@ -3363,17 +3403,7 @@ async def select_from_dropdown(
         return single_select_result
 
 
-@TraceManager.traced_async(
-    ignore_inputs=[
-        "value",
-        "page",
-        "skyvern_element",
-        "skyvern_frame",
-        "dom",
-        "incremental_scraped",
-        "dropdown_menu_element",
-    ]
-)
+@traced()
 async def select_from_dropdown_by_value(
     value: str,
     page: Page,
@@ -3600,9 +3630,7 @@ async def try_to_find_potential_scrollable_element(
     return skyvern_element
 
 
-@TraceManager.traced_async(
-    ignore_inputs=["scrollable_element", "page", "skyvern_frame", "incremental_scraped", "is_continue"]
-)
+@traced()
 async def scroll_down_to_load_all_options(
     scrollable_element: SkyvernElement,
     page: Page,

@@ -51,6 +51,8 @@ from skyvern.forge.sdk.db.id import (
     generate_task_v2_id,
     generate_thought_id,
     generate_totp_code_id,
+    generate_workflow_copilot_chat_id,
+    generate_workflow_copilot_chat_message_id,
     generate_workflow_id,
     generate_workflow_parameter_id,
     generate_workflow_permanent_id,
@@ -678,6 +680,7 @@ class ActionModel(Base):
     action_json = Column(JSON, nullable=True)
     input_or_select_context = Column(JSON, nullable=True)
     confidence_float = Column(Numeric, nullable=True)
+    screenshot_artifact_id = Column(String, nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
@@ -855,6 +858,12 @@ class PersistentBrowserSessionModel(Base):
     display_number = Column(Integer, nullable=True)
     vnc_port = Column(Integer, nullable=True)
     interactor = Column(String, nullable=True, default="agent")
+    browser_type = Column(String, nullable=True)
+    instance_type = Column(String, nullable=True)
+    vcpu_millicores = Column(Integer, nullable=True)
+    memory_mb = Column(Integer, nullable=True)
+    duration_ms = Column(BigInteger, nullable=True)
+    compute_cost = Column(Numeric, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False, index=True)
@@ -947,7 +956,7 @@ class DebugSessionModel(Base):
 
     debug_session_id = Column(String, primary_key=True, default=generate_debug_session_id)
     organization_id = Column(String, nullable=False)
-    browser_session_id = Column(String, nullable=False)
+    browser_session_id = Column(String, nullable=False, index=True)
     vnc_streaming_supported = Column(Boolean, nullable=True, server_default=sqlalchemy.true())
     workflow_permanent_id = Column(String, nullable=True)
     user_id = Column(String, nullable=True)  # comes from identity vendor (Clerk at time of writing)
@@ -1084,3 +1093,42 @@ class ScriptBlockModel(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     modified_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow, nullable=False)
     deleted_at = Column(DateTime, nullable=True)
+
+
+class WorkflowCopilotChatModel(Base):
+    __tablename__ = "workflow_copilot_chats"
+
+    workflow_copilot_chat_id = Column(String, primary_key=True, default=generate_workflow_copilot_chat_id)
+    organization_id = Column(String, nullable=False)
+    workflow_permanent_id = Column(String, nullable=False, index=True)
+    proposed_workflow = Column(JSON, nullable=True)
+    auto_accept = Column(Boolean, nullable=True, default=False)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )
+
+
+class WorkflowCopilotChatMessageModel(Base):
+    __tablename__ = "workflow_copilot_chat_messages"
+
+    workflow_copilot_chat_message_id = Column(
+        String, primary_key=True, default=generate_workflow_copilot_chat_message_id
+    )
+    workflow_copilot_chat_id = Column(String, nullable=False, index=True)
+    organization_id = Column(String, nullable=False)
+    sender = Column(String, nullable=False)
+    content = Column(UnicodeText, nullable=False)
+    global_llm_context = Column(UnicodeText, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
+    modified_at = Column(
+        DateTime,
+        default=datetime.datetime.utcnow,
+        onupdate=datetime.datetime.utcnow,
+        nullable=False,
+    )

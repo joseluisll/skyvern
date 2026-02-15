@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     TEMP_PATH: str = "./temp"
     DOWNLOAD_PATH: str = f"{REPO_ROOT_DIR}/downloads"
     BROWSER_ACTION_TIMEOUT_MS: int = 5000
+    CACHED_ACTION_DELAY_SECONDS: float = 1.0
+    # Page readiness settings for cached action execution
+    # These help prevent cached actions from executing before the page is fully loaded
+    PAGE_READY_NETWORK_IDLE_TIMEOUT_MS: float = 3000  # Wait for network idle (short timeout)
+    PAGE_READY_LOADING_INDICATOR_TIMEOUT_MS: float = 5000  # Wait for loading indicators to disappear
+    PAGE_READY_DOM_STABLE_MS: float = 300  # Time with no DOM mutations to consider stable
+    PAGE_READY_DOM_STABILITY_TIMEOUT_MS: float = 3000  # Max time to wait for DOM stability
     BROWSER_SCREENSHOT_TIMEOUT_MS: int = 20000
     BROWSER_LOADING_TIMEOUT_MS: int = 60000
     BROWSER_SCRAPING_BUILDING_ELEMENT_TREE_TIMEOUT_MS: int = 60 * 1000  # 1 minute
@@ -94,6 +101,7 @@ class Settings(BaseSettings):
     # S3/AWS settings
     AWS_REGION: str = "us-east-1"
     MAX_UPLOAD_FILE_SIZE: int = 10 * 1024 * 1024  # 10 MB
+    MAX_HTTP_DOWNLOAD_FILE_SIZE: int = 500 * 1024 * 1024  # 500 MB
     PRESIGNED_URL_EXPIRATION: int = 60 * 60 * 24  # 24 hours
     AWS_S3_BUCKET_ARTIFACTS: str = "skyvern-artifacts"
     AWS_S3_BUCKET_SCREENSHOTS: str = "skyvern-screenshots"
@@ -118,13 +126,14 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = "password"
 
     # browser settings
-    BROWSER_LOCALE: str = "en-US"
+    BROWSER_LOCALE: str | None = None  # "en-US"
     BROWSER_TIMEZONE: str = "America/New_York"
     BROWSER_WIDTH: int = 1920
     BROWSER_HEIGHT: int = 1080
     BROWSER_POLICY_FILE: str = "/etc/chromium/policies/managed/policies.json"
     BROWSER_LOGS_ENABLED: bool = True
     BROWSER_MAX_PAGES_NUMBER: int = 10
+    BROWSER_ADDITIONAL_ARGS: list[str] = []
 
     # Add extension folders name here to load extension in your browser
     EXTENSIONS_BASE_PATH: str = "./extensions"
@@ -207,6 +216,7 @@ class Settings(BaseSettings):
     OPENAI_COMPATIBLE_ADD_ASSISTANT_PREFIX: bool = False
     OPENAI_COMPATIBLE_MODEL_KEY: str = "OPENAI_COMPATIBLE"
     OPENAI_COMPATIBLE_REASONING_EFFORT: str | None = None
+    OPENAI_COMPATIBLE_GITHUB_COPILOT_DOMAIN: str = "githubcopilot.com"
 
     # AZURE
     AZURE_DEPLOYMENT: str | None = None
@@ -303,6 +313,8 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_INCLUDE_THOUGHT: bool = False
     GEMINI_THINKING_BUDGET: int | None = None
+    DEFAULT_THINKING_BUDGET: int = 1024
+    EXTRACT_ACTION_THINKING_BUDGET: int = 512
 
     # VERTEX_AI
     VERTEX_CREDENTIALS: str | None = None
@@ -373,6 +385,7 @@ class Settings(BaseSettings):
     BITWARDEN_SERVER_PORT: int = 8002
 
     SVG_MAX_LENGTH: int = 100000
+    SVG_MAX_PARSING_ELEMENT_CNT: int = 3000
 
     ENABLE_LOG_ARTIFACTS: bool = False
     ENABLE_CODE_BLOCK: bool = True
@@ -395,12 +408,6 @@ class Settings(BaseSettings):
     The secret used to sign the email/identity of the user.
     """
 
-    # Trace settings
-    TRACE_ENABLED: bool = False
-    TRACE_PROVIDER: str = ""
-    TRACE_PROVIDER_HOST: str | None = None
-    TRACE_PROVIDER_API_KEY: str = "fillmein"
-
     # Debug Session Settings
     DEBUG_SESSION_TIMEOUT_MINUTES: int = 20
     """
@@ -420,6 +427,14 @@ class Settings(BaseSettings):
     ENCRYPTOR_AES_SALT: str | None = None
     ENCRYPTOR_AES_IV: str | None = None
 
+    # OpenTelemetry Settings
+    OTEL_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "skyvern"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4317"
+    OTEL_METRICS_ENABLED: bool = True
+    OTEL_LOGS_ENABLED: bool = True
+    OTEL_EXPORTER_INSECURE: bool = True
+
     # script generation settings
     WORKFLOW_START_BLOCK_LABEL: str = "__start_block__"
 
@@ -428,76 +443,63 @@ class Settings(BaseSettings):
         Keys are model names available to blocks in the frontend. These map to key names
         in LLMConfigRegistry._configs.
         """
+        mapping: dict[str, dict[str, str]] = {
+            "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
+            "gemini-2.5-flash": {
+                "llm_key": "VERTEX_GEMINI_2.5_FLASH",
+                "label": "Gemini 2.5 Flash",
+            },
+            "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
+            "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
+            "gemini-2.5-flash-lite": {
+                "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
+                "label": "Gemini 2.5 Flash Lite",
+            },
+        }
 
-        if self.is_cloud_environment():
-            return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                    "label": "Gemini 2.5 Flash",
-                },
-                "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
-                "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-                "gemini-2.5-flash-lite": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-                    "label": "Gemini 2.5 Flash Lite",
-                },
-                "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
-                "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
-                "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
-                "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
-                "us.anthropic.claude-opus-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Opus",
-                },
-                "us.anthropic.claude-sonnet-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Sonnet",
-                },
-                "claude-haiku-4-5-20251001": {
-                    "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
-                    "label": "Anthropic Claude 4.5 Haiku",
-                },
-                # "claude-sonnet-4-20250514": {
-                #     "llm_key": "ANTHROPIC_CLAUDE4_SONNET",
-                #     "label": "Anthropic Claude 4 Sonnet",
-                # },
-                # "claude-opus-4-20250514": {
-                #     "llm_key": "ANTHROPIC_CLAUDE4_OPUS",
-                #     "label": "Anthropic Claude 4 Opus",
-                # },
+        # GPT models: prefer Azure when enabled, fall back to OpenAI
+        gpt_models = [
+            ("azure/gpt-4.1", self.ENABLE_AZURE_GPT4_1, "AZURE_OPENAI_GPT4_1", "OPENAI_GPT4_1", "GPT 4.1"),
+            ("azure/gpt-5", self.ENABLE_AZURE_GPT5, "AZURE_OPENAI_GPT5", "OPENAI_GPT5", "GPT 5"),
+            (
+                "azure/gpt-5-mini",
+                self.ENABLE_AZURE_GPT5_MINI,
+                "AZURE_OPENAI_GPT5_MINI",
+                "OPENAI_GPT5_MINI",
+                "GPT 5 Mini",
+            ),
+            ("azure/gpt-5.2", self.ENABLE_AZURE_GPT5_2, "AZURE_OPENAI_GPT5_2", "OPENAI_GPT5_2", "GPT 5.2"),
+            ("azure/o3", self.ENABLE_AZURE_O3, "AZURE_OPENAI_O3", "OPENAI_O3", "GPT O3"),
+        ]
+        for model_name, azure_enabled, azure_key, openai_key, label in gpt_models:
+            mapping[model_name] = {"llm_key": azure_key if azure_enabled else openai_key, "label": label}
+
+        # Anthropic models: prefer Bedrock when enabled, fall back to direct API
+        if self.ENABLE_BEDROCK_ANTHROPIC:
+            mapping["us.anthropic.claude-opus-4-20250514-v1:0"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4 Opus",
+            }
+            mapping["us.anthropic.claude-sonnet-4-20250514-v1:0"] = {
+                "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
+                "label": "Anthropic Claude 4 Sonnet",
             }
         else:
-            # TODO: apparently the list for OSS is to be much larger
-            return {
-                "gemini-2.5-pro-preview-05-06": {"llm_key": "VERTEX_GEMINI_2.5_PRO", "label": "Gemini 2.5 Pro"},
-                "gemini-2.5-flash": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH",
-                    "label": "Gemini 2.5 Flash",
-                },
-                "gemini-3-pro-preview": {"llm_key": "VERTEX_GEMINI_3.0_PRO", "label": "Gemini 3 Pro"},
-                "gemini-3.0-flash": {"llm_key": "VERTEX_GEMINI_3.0_FLASH", "label": "Gemini 3 Flash"},
-                "gemini-2.5-flash-lite": {
-                    "llm_key": "VERTEX_GEMINI_2.5_FLASH_LITE",
-                    "label": "Gemini 2.5 Flash Lite",
-                },
-                "azure/gpt-4.1": {"llm_key": "AZURE_OPENAI_GPT4_1", "label": "GPT 4.1"},
-                "azure/gpt-5": {"llm_key": "AZURE_OPENAI_GPT5", "label": "GPT 5"},
-                "azure/gpt-5.2": {"llm_key": "AZURE_OPENAI_GPT5_2", "label": "GPT 5.2"},
-                "azure/o3": {"llm_key": "AZURE_OPENAI_O3", "label": "GPT O3"},
-                "us.anthropic.claude-opus-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_OPUS_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Opus",
-                },
-                "us.anthropic.claude-sonnet-4-20250514-v1:0": {
-                    "llm_key": "BEDROCK_ANTHROPIC_CLAUDE4_SONNET_INFERENCE_PROFILE",
-                    "label": "Anthropic Claude 4 Sonnet",
-                },
-                "claude-haiku-4-5-20251001": {
-                    "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
-                    "label": "Anthropic Claude 4.5 Haiku",
-                },
+            mapping["us.anthropic.claude-opus-4-20250514-v1:0"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4_OPUS",
+                "label": "Anthropic Claude 4 Opus",
             }
+            mapping["us.anthropic.claude-sonnet-4-20250514-v1:0"] = {
+                "llm_key": "ANTHROPIC_CLAUDE4_SONNET",
+                "label": "Anthropic Claude 4 Sonnet",
+            }
+
+        mapping["claude-haiku-4-5-20251001"] = {
+            "llm_key": "ANTHROPIC_CLAUDE4.5_HAIKU",
+            "label": "Anthropic Claude 4.5 Haiku",
+        }
+
+        return mapping
 
     def model_post_init(self, __context: Any) -> None:  # type: ignore[override]
         super().model_post_init(__context)

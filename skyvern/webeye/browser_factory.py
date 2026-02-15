@@ -236,8 +236,8 @@ class BrowserContextFactory:
             browser_args.extend([f"--disable-extensions-except={joined_paths}", f"--load-extension={joined_paths}"])
             LOG.info("Extensions added to browser args", extensions=joined_paths)
 
+        browser_args.extend(settings.BROWSER_ADDITIONAL_ARGS)
         args = {
-            "locale": settings.BROWSER_LOCALE,
             "color_scheme": "no-preference",
             "args": browser_args,
             "ignore_default_args": [
@@ -251,6 +251,8 @@ class BrowserContextFactory:
             },
             "extra_http_headers": extra_http_headers,
         }
+        if settings.BROWSER_LOCALE:
+            args["locale"] = settings.BROWSER_LOCALE
 
         if settings.ENABLE_PROXY:
             proxy_config = setup_proxy()
@@ -769,8 +771,8 @@ async def _create_cdp_connection_browser(
                     "--remote-debugging-port=9222",
                     "--no-first-run",
                     "--no-default-browser-check",
-                    "--remote-debugging-address=0.0.0.0",
                     "--user-data-dir=./tmp/user_data_dir",
+                    "--remote-debugging-address=0.0.0.0",
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

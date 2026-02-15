@@ -16,6 +16,7 @@ from typing import Any, Tuple, cast
 import httpx
 import structlog
 from openai.types.responses.response import Response as OpenAIResponse
+from opentelemetry import trace as otel_trace
 from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page
 
@@ -91,7 +92,7 @@ from skyvern.forge.sdk.schemas.files import FileInfo
 from skyvern.forge.sdk.schemas.organizations import Organization
 from skyvern.forge.sdk.schemas.tasks import Task, TaskRequest, TaskResponse, TaskStatus
 from skyvern.forge.sdk.schemas.totp_codes import OTPType
-from skyvern.forge.sdk.trace import TraceManager
+from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.workflow.context_manager import WorkflowRunContext
 from skyvern.forge.sdk.workflow.models.block import (
     ActionBlock,
@@ -116,6 +117,7 @@ from skyvern.webeye.actions.actions import (
     DownloadFileAction,
     ExtractAction,
     GotoUrlAction,
+    KeypressAction,
     ReloadPageAction,
     TerminateAction,
     WebAction,
@@ -305,9 +307,7 @@ class ForgeAgent:
         operations = await app.AGENT_FUNCTION.generate_async_operations(organization, task, page)
         self.async_operation_pool.add_operations(task.task_id, operations)
 
-    @TraceManager.traced_async(
-        ignore_inputs=["api_key", "close_browser_on_completion", "task_block", "cua_response", "llm_caller"]
-    )
+    @traced()
     async def execute_step(
         self,
         organization: Organization,
@@ -895,9 +895,7 @@ class ForgeAgent:
             )
             return True
 
-    @TraceManager.traced_async(
-        ignore_inputs=["browser_state", "organization", "task_block", "cua_response", "llm_caller"]
-    )
+    @traced()
     async def agent_step(
         self,
         task: Task,
@@ -1231,8 +1229,8 @@ class ForgeAgent:
                         action_order=action_idx,
                     )
                     detailed_agent_step_output.actions_and_results[action_idx] = (action, [action_result])
-                    await app.DATABASE.create_action(action=action)
-                    await self.record_artifacts_after_action(task, step, browser_state, engine)
+                    action.action_id = (await app.DATABASE.create_action(action=action)).action_id
+                    await self.record_artifacts_after_action(task, step, browser_state, engine, action)
                     break
 
                 action = action_node.action
@@ -1288,6 +1286,16 @@ class ForgeAgent:
                         "is_retry": step.retry_index > 0,
                     }
 
+                # Tell the handler to skip the auto-completion Tab hack when the
+                # next batched action would be broken by a focus change — e.g. a
+                # KEYPRESS Enter or another action on the same element.
+                if action.action_type == ActionType.INPUT_TEXT and action_idx + 1 < len(action_linked_list):
+                    next_action = action_linked_list[action_idx + 1].action
+                    if isinstance(next_action, KeypressAction) or (
+                        isinstance(next_action, WebAction) and next_action.element_id == action.element_id
+                    ):
+                        action.skip_auto_complete_tab = True
+
                 results = await ActionHandler.handle_action(
                     scraped_page=scraped_page,
                     task=task,
@@ -1319,7 +1327,7 @@ class ForgeAgent:
                         )
 
                 await asyncio.sleep(wait_time)
-                await self.record_artifacts_after_action(task, step, browser_state, engine)
+                await self.record_artifacts_after_action(task, step, browser_state, engine, action)
                 for result in results:
                     result.step_retry_number = step.retry_index
                     result.step_order = step.order
@@ -1798,6 +1806,7 @@ class ForgeAgent:
 
     async def _speculate_next_step_plan(
         self,
+        organization: Organization,
         task: Task,
         current_step: Step,
         next_step: Step,
@@ -1814,6 +1823,9 @@ class ForgeAgent:
 
         try:
             next_step.is_speculative = True
+
+            if page := await browser_state.get_working_page():
+                await self.register_async_operations(organization, task, page)
 
             scraped_page, extract_action_prompt, use_caching, prompt_name = await self.build_and_record_step_prompt(
                 task,
@@ -1832,6 +1844,8 @@ class ForgeAgent:
                 task.llm_key,
                 default=app.LLM_API_HANDLER,
             )
+
+            self.async_operation_pool.run_operation(task.task_id, AgentPhase.llm)
 
             llm_json_response = await llm_api_handler(
                 prompt=extract_action_prompt,
@@ -2192,6 +2206,7 @@ class ForgeAgent:
         step: Step,
         browser_state: BrowserState,
         engine: RunEngine,
+        action: Action,
     ) -> None:
         working_page = await browser_state.get_working_page()
         if not working_page:
@@ -2213,6 +2228,7 @@ class ForgeAgent:
             scrolling_number = 0
 
         artifacts: list[BulkArtifactCreationRequest | None] = []
+        screenshot_artifact_id: str | None = None
         try:
             # get current x, y position of the page
             x: int | None = None
@@ -2230,13 +2246,17 @@ class ForgeAgent:
             if skyvern_frame and x is not None and y is not None:
                 await skyvern_frame.safe_scroll_to_x_y(x, y)
                 LOG.debug("Scrolled back to the original x, y position of the page after taking screenshot", x=x, y=y)
-                artifacts.append(
-                    await app.ARTIFACT_MANAGER.prepare_llm_artifact(
-                        data=screenshot,
-                        artifact_type=ArtifactType.SCREENSHOT_ACTION,
-                        step=step,
-                    )
+                screenshot_request = await app.ARTIFACT_MANAGER.prepare_llm_artifact(
+                    data=screenshot,
+                    artifact_type=ArtifactType.SCREENSHOT_ACTION,
+                    step=step,
                 )
+                if screenshot_request:
+                    artifacts.append(screenshot_request)
+                    for artifact_data in screenshot_request.artifacts:
+                        if artifact_data.artifact_model.artifact_type == ArtifactType.SCREENSHOT_ACTION:
+                            screenshot_artifact_id = artifact_data.artifact_model.artifact_id
+                            break
         except Exception:
             LOG.error(
                 "Failed to record screenshot after action",
@@ -2261,6 +2281,23 @@ class ForgeAgent:
                 await app.ARTIFACT_MANAGER.bulk_create_artifacts(artifacts)
             except Exception:
                 LOG.warning("Failed to bulk create artifacts after action", exc_info=True)
+            else:
+                if screenshot_artifact_id and action.action_id and action.organization_id:
+                    try:
+                        # TODO: consider batching screenshot artifact updates to reduce per-action DB writes.
+                        await app.DATABASE.update_action_screenshot_artifact_id(
+                            organization_id=action.organization_id,
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                        )
+                        action.screenshot_artifact_id = screenshot_artifact_id
+                    except Exception:
+                        LOG.warning(
+                            "Failed to update action with screenshot artifact id",
+                            action_id=action.action_id,
+                            screenshot_artifact_id=screenshot_artifact_id,
+                            exc_info=True,
+                        )
 
         try:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
@@ -2433,8 +2470,23 @@ class ForgeAgent:
                     break
                 except (FailedToTakeScreenshot, ScrapingFailed) as e:
                     if idx < len(SCRAPE_TYPE_ORDER) - 1:
+                        LOG.warning(
+                            "Scrape attempt failed, will retry with next strategy",
+                            attempt=idx + 1,
+                            scrape_type=scrape_type.value if hasattr(scrape_type, "value") else str(scrape_type),
+                            error_type=e.__class__.__name__,
+                            url=task.url,
+                        )
                         continue
-                    LOG.exception(f"{e.__class__.__name__} happened in two normal attempts and reload-page retry")
+                    LOG.error(
+                        "All scrape attempts failed",
+                        total_attempts=len(SCRAPE_TYPE_ORDER),
+                        error_type=e.__class__.__name__,
+                        url=task.url,
+                        step_order=step.order,
+                        step_retry=step.retry_index,
+                        exc_info=True,
+                    )
                     raise e
 
         if scraped_page is None:
@@ -2638,8 +2690,23 @@ class ForgeAgent:
                 llm_config = LLMConfigRegistry.get_config(resolved_llm_key)
                 extracted_name = None
 
+                # For router configs (LLMRouterConfig), extract from model_list primary model FIRST
+                # This must be checked before model_name since router model_name is just an identifier
+                # (e.g., "gemini-3.0-flash-gpt-5-mini-fallback-router"), not an actual Vertex model
+                if hasattr(llm_config, "model_list") and hasattr(llm_config, "main_model_group"):
+                    # Find the primary model in model_list by matching main_model_group
+                    for model_entry in llm_config.model_list:
+                        if model_entry.model_name == llm_config.main_model_group:
+                            # Extract actual model name from litellm_params
+                            model_param = model_entry.litellm_params.get("model", "")
+                            if "vertex_ai/" in model_param:
+                                extracted_name = model_param.split("/")[-1]
+                            elif model_param.startswith("gemini-"):
+                                extracted_name = model_param
+                            break
+
                 # Try to extract from model_name if it contains "vertex_ai/" or starts with "gemini-"
-                if hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
+                if not extracted_name and hasattr(llm_config, "model_name") and isinstance(llm_config.model_name, str):
                     if "vertex_ai/" in llm_config.model_name:
                         # Direct Vertex config: "vertex_ai/gemini-2.5-flash" -> "gemini-2.5-flash"
                         extracted_name = llm_config.model_name.split("/")[-1]
@@ -2676,8 +2743,11 @@ class ForgeAgent:
             except Exception as e:
                 LOG.debug("Failed to extract model name from config, using default", error=str(e))
 
-            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro)
-            match = re.search(r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro))", model_name, re.IGNORECASE)
+            # Normalize model name to the canonical Vertex identifier (e.g., gemini-2.5-pro).
+            # Preserve preview suffixes so we don't strip required identifiers (e.g., gemini-3-flash-preview).
+            match = re.search(
+                r"(gemini-\d+(?:\.\d+)?-(?:flash-lite|flash|pro)(?:-preview)?)", model_name, re.IGNORECASE
+            )
             if match:
                 model_name = match.group(1).lower()
 
@@ -3228,7 +3298,7 @@ class ForgeAgent:
         analytics.capture("skyvern-oss-agent-task-status", {"status": task.status})
 
         # Add task completion tag to trace
-        TraceManager.add_task_completion_tag(task.status.value)
+        otel_trace.get_current_span().set_attribute("task.completion_status", task.status.value)
         if need_final_screenshot:
             # Take one last screenshot and create an artifact before closing the browser to see the final state
             # We don't need the artifacts and send the webhook response directly only when there is an issue with the browser
@@ -3338,7 +3408,7 @@ class ForgeAgent:
                 "Sending task response to webhook callback url",
                 task_id=task.task_id,
                 webhook_callback_url=task.webhook_callback_url,
-                payload=signed_data.signed_payload,
+                payload=signed_data.payload_for_log,
                 headers=signed_data.headers,
             )
 
@@ -3383,11 +3453,13 @@ class ForgeAgent:
         last_step: Step | None = None,
         failure_reason: str | None = None,
         need_browser_log: bool = False,
+        step_count: int | None = None,
     ) -> TaskResponse:
         # no last step means the task didn't start, so we don't have any other artifacts
         if last_step is None:
             return task.to_task_response(
                 failure_reason=failure_reason,
+                step_count=step_count,
             )
 
         screenshot_url = None
@@ -3489,6 +3561,7 @@ class ForgeAgent:
             browser_console_log_url=browser_console_log_url,
             downloaded_files=downloaded_files,
             failure_reason=failure_reason,
+            step_count=step_count,
         )
 
     async def cleanup_browser_and_create_artifacts(
@@ -3515,6 +3588,7 @@ class ForgeAgent:
             video_artifacts = await app.BROWSER_MANAGER.get_video_artifacts(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading video artifacts", number_of_video_artifacts=len(video_artifacts))
             for video_artifact in video_artifacts:
                 await app.ARTIFACT_MANAGER.update_artifact_data(
                     artifact_id=video_artifact.video_artifact_id,
@@ -3523,6 +3597,7 @@ class ForgeAgent:
                 )
 
             har_data = await app.BROWSER_MANAGER.get_har_data(task_id=task.task_id, browser_state=browser_state)
+            LOG.debug("Uploading har data", har_size=len(har_data))
             if har_data:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
@@ -3533,6 +3608,7 @@ class ForgeAgent:
             browser_log = await app.BROWSER_MANAGER.get_browser_console_log(
                 task_id=task.task_id, browser_state=browser_state
             )
+            LOG.debug("Uploading browser log", browser_log_size=len(browser_log))
             if browser_log:
                 await app.ARTIFACT_MANAGER.create_artifact(
                     step=last_step,
@@ -3710,6 +3786,7 @@ class ForgeAgent:
 
         speculative_task = asyncio.create_task(
             self._speculate_next_step_plan(
+                organization=organization,
                 task=task,
                 current_step=step,
                 next_step=next_step,
@@ -3757,7 +3834,7 @@ class ForgeAgent:
                 persisted_action.action_order = len(step.output.actions_and_results)
 
             action_results = await ActionHandler.handle_action(scraped_page, task, step, working_page, persisted_action)
-            await self.record_artifacts_after_action(task, step, browser_state, engine)
+            await self.record_artifacts_after_action(task, step, browser_state, engine, persisted_action)
             step.output.action_results.extend(action_results)
             step.output.actions_and_results.append((persisted_action, action_results))
             if isinstance(persisted_action, DecisiveAction) and persisted_action.errors:
@@ -4089,8 +4166,10 @@ class ForgeAgent:
             # Check for LLM provider errors in the failed steps
             for step_cnt, cur_step in enumerate(steps[-max_retries:]):
                 if cur_step.status == StepStatus.failed:
-                    # If step failed with no actions, it might be an LLM error during action extraction
-                    if not cur_step.output or not cur_step.output.actions_and_results:
+                    # Only count steps where the LLM call itself failed (no output at all).
+                    # Steps with output but empty actions mean the LLM worked fine but found
+                    # nothing to interact with — those fall through to normal summarization.
+                    if not cur_step.output:
                         steps_without_actions += 1
 
                 if cur_step.output and cur_step.output.actions_and_results:

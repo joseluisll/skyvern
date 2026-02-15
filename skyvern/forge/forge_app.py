@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, cast
 
+import structlog
 from anthropic import AsyncAnthropic, AsyncAnthropicBedrock
 from fastapi import FastAPI
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -37,9 +38,13 @@ from skyvern.forge.sdk.workflow.service import WorkflowService
 from skyvern.services.browser_recording.service import BrowserSessionRecordingService
 from skyvern.services.streaming import StreamingService
 from skyvern.webeye.browser_manager import BrowserManager
+from skyvern.webeye.default_persistent_sessions_manager import DefaultPersistentSessionsManager
 from skyvern.webeye.persistent_sessions_manager import PersistentSessionsManager
 from skyvern.webeye.real_browser_manager import RealBrowserManager
 from skyvern.webeye.scraper.scraper import ScrapeExcludeFunc
+
+LOG = structlog.get_logger()
+STREAMING_SUPPORTED_OS = {"linux", "wsl"}
 
 
 class ForgeApp:
@@ -76,7 +81,7 @@ class ForgeApp:
     AGENT_FUNCTION: AgentFunction
     PERSISTENT_SESSIONS_MANAGER: PersistentSessionsManager
     BROWSER_SESSION_RECORDING_SERVICE: BrowserSessionRecordingService
-    STREAMING_SERVICE: StreamingService
+    STREAMING_SERVICE: StreamingService | None
     BITWARDEN_CREDENTIAL_VAULT_SERVICE: BitwardenCredentialVaultService
     AZURE_CREDENTIAL_VAULT_SERVICE: AzureCredentialVaultService | None
     CUSTOM_CREDENTIAL_VAULT_SERVICE: CustomCredentialVaultService | None
@@ -85,7 +90,7 @@ class ForgeApp:
     authentication_function: Callable[[str], Awaitable[Organization]] | None
     authenticate_user_function: Callable[[str], Awaitable[str | None]] | None
     setup_api_app: Callable[[FastAPI], None] | None
-    api_app_startup_event: Callable[[], Awaitable[None]] | None
+    api_app_startup_event: Callable[[FastAPI], Awaitable[None]] | None
     api_app_shutdown_event: Callable[[], Awaitable[None]] | None
     agent: ForgeAgent
 
@@ -122,11 +127,15 @@ def create_forge_app() -> ForgeApp:
         http_client=ForgeAsyncHttpxClientWrapper(),
     )
     if settings.ENABLE_AZURE_CUA:
+        if settings.AZURE_CUA_ENDPOINT is None or settings.AZURE_CUA_DEPLOYMENT is None:
+            raise RuntimeError("Azure CUA enabled but endpoint or deployment is not configured")
+        azure_endpoint = cast(str, settings.AZURE_CUA_ENDPOINT)
+        azure_deployment = cast(str, settings.AZURE_CUA_DEPLOYMENT)
         app.OPENAI_CLIENT = AsyncAzureOpenAI(
             api_key=settings.AZURE_CUA_API_KEY,
             api_version=settings.AZURE_CUA_API_VERSION,
-            azure_endpoint=settings.AZURE_CUA_ENDPOINT,
-            azure_deployment=settings.AZURE_CUA_DEPLOYMENT,
+            azure_endpoint=azure_endpoint,
+            azure_deployment=azure_deployment,
         )
 
     app.ANTHROPIC_CLIENT = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -193,9 +202,15 @@ def create_forge_app() -> ForgeApp:
     app.WORKFLOW_CONTEXT_MANAGER = WorkflowContextManager()
     app.WORKFLOW_SERVICE = WorkflowService()
     app.AGENT_FUNCTION = AgentFunction()
-    app.PERSISTENT_SESSIONS_MANAGER = PersistentSessionsManager(database=app.DATABASE)
+    app.PERSISTENT_SESSIONS_MANAGER = DefaultPersistentSessionsManager(database=app.DATABASE)
     app.BROWSER_SESSION_RECORDING_SERVICE = BrowserSessionRecordingService()
-    app.STREAMING_SERVICE = StreamingService(database=app.DATABASE)
+    operating_system = detect_os()
+    if operating_system in STREAMING_SUPPORTED_OS:
+        LOG.info("Streaming service enabled for detected linux OS", os=operating_system)
+        app.STREAMING_SERVICE = StreamingService()
+    else:
+        LOG.info("Streaming service disabled on unsupported OS", os=operating_system)
+        app.STREAMING_SERVICE = None
 
     app.AZURE_CLIENT_FACTORY = RealAzureClientFactory()
     app.BITWARDEN_CREDENTIAL_VAULT_SERVICE = BitwardenCredentialVaultService()
@@ -246,6 +261,22 @@ def create_forge_app() -> ForgeApp:
     app.setup_api_app = None
     app.api_app_startup_event = None
     app.api_app_shutdown_event = None
+
+    # Set up startup/shutdown events to manage streaming service monitoring
+    if app.STREAMING_SERVICE:
+        # Capture the streaming service in a local variable for the closures
+        streaming_service = app.STREAMING_SERVICE
+
+        async def _startup_event(fastapi_app: FastAPI) -> None:
+            structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
+            streaming_service.start_monitoring()
+
+        async def _shutdown_event() -> None:
+            structlog.get_logger(__name__).info("Stopping streaming service monitoring loop")
+            await streaming_service.stop_monitoring()
+
+        app.api_app_startup_event = _startup_event
+        app.api_app_shutdown_event = _shutdown_event
 
     app.agent = ForgeAgent()
 

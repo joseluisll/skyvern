@@ -1,0 +1,190 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Skyvern",
+  "colors": {
+    "primary": "#6366F1",
+    "light": "#818CF8",
+    "dark": "#4F46E5"
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg",
+    "href": "https://skyvern.com"
+  },
+  "favicon": "/favicon.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "getting-started/quickstart",
+              "getting-started/core-concepts"
+            ]
+          },
+          {
+            "group": "Running Automations",
+            "pages": [
+              "running-automations/run-a-task",
+              "running-automations/task-parameters",
+              "running-automations/extract-structured-data"
+            ]
+          },
+          {
+            "group": "Multi-Step Automations",
+            "pages": [
+              "multi-step-automations/build-a-workflow",
+              "multi-step-automations/workflow-blocks-reference",
+              "multi-step-automations/file-operations",
+              "multi-step-automations/workflow-parameters"
+            ]
+          },
+          {
+            "group": "Optimization",
+            "pages": [
+              "optimization/browser-sessions",
+              "optimization/browser-profiles",
+              "optimization/cost-control"
+            ]
+          },
+          {
+            "group": "Going to Production",
+            "pages": [
+              "going-to-production/webhooks",
+              "going-to-production/proxy-geolocation",
+              "going-to-production/error-handling",
+              "going-to-production/reliability-tips",
+              "going-to-production/captcha-bot-detection",
+              "integrations/mcp"
+            ]
+          },
+          {
+            "group": "Debugging",
+            "pages": [
+              "debugging/using-artifacts",
+              "debugging/troubleshooting-guide",
+              "debugging/faq"
+            ]
+          },
+          {
+            "group": "Self-Hosted Deployment",
+            "pages": [
+              "self-hosted/overview",
+              "self-hosted/docker",
+              "self-hosted/llm-configuration",
+              "self-hosted/browser",
+              "self-hosted/proxy",
+              "self-hosted/kubernetes",
+              "self-hosted/storage",
+              "integrations/local-llms"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Cloud UI",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "cloud/overview",
+              "cloud/run-your-first-task",
+              "cloud/run-a-task",
+              "cloud/monitor-a-run"
+            ]
+          },
+          {
+            "group": "Building Workflows",
+            "pages": [
+              "cloud/build-a-workflow",
+              "cloud/manage-workflows",
+              "cloud/add-parameters",
+              "cloud/configure-blocks",
+              "cloud/run-a-workflow"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/zapier",
+              "integrations/make",
+              "integrations/n8n",
+              "integrations/workato"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SDKs",
+        "groups": [
+          {
+            "group": "Python SDK",
+            "pages": [
+              "sdk-reference/overview",
+              "sdk-reference/tasks",
+              "sdk-reference/workflows",
+              "sdk-reference/browser-sessions",
+              "sdk-reference/browser-profiles",
+              "sdk-reference/credentials",
+              "sdk-reference/helpers",
+              "sdk-reference/error-handling",
+              "sdk-reference/complete-reference"
+            ]
+          },
+        {
+            "group": "TypeScript SDK",
+            "pages": [
+              "ts-sdk-reference/overview",
+              "ts-sdk-reference/tasks",
+              "ts-sdk-reference/workflows",
+              "ts-sdk-reference/browser-sessions",
+              "ts-sdk-reference/browser-profiles",
+              "ts-sdk-reference/credentials",
+              "ts-sdk-reference/helpers",
+              "ts-sdk-reference/browser-automation",
+              "ts-sdk-reference/error-handling",
+              "ts-sdk-reference/complete-reference"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.json"
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Dashboard",
+        "href": "https://app.skyvern.com"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get API Key",
+      "href": "https://app.skyvern.com/settings/api-keys"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/Skyvern-AI/skyvern",
+      "discord": "https://discord.gg/skyvern",
+      "twitter": "https://twitter.com/skyvernai"
+    }
+  },
+  "api": {
+    "baseUrl": "https://api.skyvern.com",
+    "auth": {
+      "method": "key",
+      "name": "x-api-key"
+    },
+    "playground": {
+      "display": "interactive"
+    }
+  }
+}
