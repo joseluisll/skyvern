@@ -52,7 +52,12 @@ class StreamingService:
         self._lock: asyncio.Lock = asyncio.Lock()
 
     def _allocate_display(self) -> int:
-        """Allocate a free display number."""
+        """
+        Allocate a free display number.
+
+        WARNING: This method must only be called while holding self._lock.
+        It modifies shared state (self._used_displays) without internal synchronization.
+        """
         display = BASE_DISPLAY
         while display in self._used_displays:
             display += 1
@@ -60,7 +65,12 @@ class StreamingService:
         return display
 
     def _allocate_port(self) -> int:
-        """Allocate a free VNC port."""
+        """
+        Allocate a free VNC port.
+
+        WARNING: This method must only be called while holding self._lock.
+        It modifies shared state (self._used_ports) without internal synchronization.
+        """
         port = BASE_VNC_PORT
         while port in self._used_ports:
             port += 1
