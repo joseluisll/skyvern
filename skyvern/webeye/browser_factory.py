@@ -291,6 +291,26 @@ class BrowserContextFactory:
         browser_type = settings.BROWSER_TYPE
         browser_context: BrowserContext | None = None
         try:
+            # Set DISPLAY from browser session if available (for VNC support)
+            workflow_run_id = kwargs.get("workflow_run_id")
+            task_id = kwargs.get("task_id")
+            organization_id = kwargs.get("organization_id")
+            runnable_id = workflow_run_id or task_id
+
+            if runnable_id and organization_id:
+                browser_session = await app.DATABASE.get_persistent_browser_session_by_runnable_id(
+                    runnable_id, organization_id
+                )
+                if browser_session and browser_session.display_number:
+                    # Pass display_number via kwargs instead of using global os.environ
+                    # This avoids race conditions when launching multiple browsers in parallel
+                    kwargs["display_number"] = browser_session.display_number
+                    LOG.info(
+                        "Set DISPLAY for browser from session",
+                        display=browser_session.display_number,
+                        runnable_id=runnable_id,
+                    )
+
             creator = cls._creators.get(browser_type)
             if not creator:
                 raise UnknownBrowserType(browser_type)
@@ -384,6 +404,12 @@ def _get_cdp_port(kwargs: dict) -> int | None:
     return None
 
 
+def _apply_display_env(browser_args: dict[str, Any], display_number: int | None) -> None:
+    """Set DISPLAY environment variable for VNC support."""
+    if display_number:
+        browser_args["env"] = {**os.environ, "DISPLAY": f":{display_number}"}
+
+
 def _is_port_in_use(port: int) -> bool:
     """Check if a port is already in use."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -470,6 +496,10 @@ async def _create_headless_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
+
+    # Set DISPLAY environment variable for the browser process (for VNC support)
+    _apply_display_env(browser_args, kwargs.get("display_number"))
+
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
 
@@ -535,6 +565,10 @@ async def _create_headful_chromium(
         har_path=browser_args["record_har_path"],
         browser_session_dir=user_data_dir,
     )
+
+    # Set DISPLAY environment variable for the browser process (for VNC support)
+    _apply_display_env(browser_args, kwargs.get("display_number"))
+
     browser_context = await playwright.chromium.launch_persistent_context(**browser_args)
     return browser_context, browser_artifacts, None
 
