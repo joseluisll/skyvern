@@ -61,6 +61,9 @@ class PersistentBrowserSession(BaseModel):
     deleted_at: datetime | None = None
     extensions: list[Extensions] | None = None
     browser_type: PersistentBrowserType | None = None
+    display_number: int | None = None
+    vnc_port: int | None = None
+    interactor: str | None = "agent"
 
 
 class AddressablePersistentBrowserSession(PersistentBrowserSession):

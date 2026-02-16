@@ -279,7 +279,7 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             "Creating new browser session",
             organization_id=organization_id,
         )
-        return await self.database.create_persistent_browser_session(
+        browser_session_db = await self.database.create_persistent_browser_session(
             organization_id=organization_id,
             runnable_type=runnable_type,
             runnable_id=runnable_id,
@@ -288,6 +288,27 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
             extensions=extensions,
             browser_type=browser_type,
         )
+
+        # Start VNC for this session via StreamingService
+        try:
+            display, vnc_port = await app.STREAMING_SERVICE.start_vnc_for_session(
+                session_id=browser_session_db.persistent_browser_session_id,
+                organization_id=organization_id,
+            )
+            LOG.info(
+                "VNC started for browser session",
+                session_id=browser_session_db.persistent_browser_session_id,
+                display=display,
+                vnc_port=vnc_port,
+            )
+        except Exception as e:
+            LOG.exception(
+                "Failed to start VNC for browser session",
+                session_id=browser_session_db.persistent_browser_session_id,
+                error=str(e),
+            )
+
+        return browser_session_db
 
     async def occupy_browser_session(
         self,
@@ -322,6 +343,23 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
 
     async def close_session(self, organization_id: str, browser_session_id: str) -> None:
         """Close a specific browser session."""
+        # Stop VNC for this session via StreamingService
+        try:
+            await app.STREAMING_SERVICE.stop_vnc_for_session(
+                session_id=browser_session_id,
+                organization_id=organization_id,
+            )
+            LOG.info(
+                "VNC stopped for browser session",
+                browser_session_id=browser_session_id,
+            )
+        except Exception as e:
+            LOG.warning(
+                "Failed to stop VNC for browser session",
+                browser_session_id=browser_session_id,
+                error=str(e),
+            )
+
         browser_session = self._browser_sessions.get(browser_session_id)
         if browser_session:
             LOG.info(
