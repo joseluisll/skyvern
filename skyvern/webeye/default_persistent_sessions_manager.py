@@ -301,6 +301,13 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
                 display=display,
                 vnc_port=vnc_port,
             )
+            # Update database with VNC info
+            browser_session_db = await self.database.update_persistent_browser_session(
+                browser_session_id=browser_session_db.persistent_browser_session_id,
+                organization_id=organization_id,
+                display_number=display,
+                vnc_port=vnc_port,
+            )
         except Exception as e:
             LOG.exception(
                 "Failed to start VNC for browser session",

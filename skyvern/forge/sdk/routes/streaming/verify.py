@@ -261,7 +261,7 @@ async def verify_workflow_run(
                     organization_id=organization_id,
                 )
             except Exception as ex:
-                LOG.warning(
+                LOG.debug(
                     "Exception getting browser address.",
                     workflow_run_id=workflow_run_id,
                     organization_id=organization_id,

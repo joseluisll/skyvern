@@ -110,6 +110,7 @@ class StreamingService:
         if xvfb.poll() is not None:
             LOG.error("Xvfb failed to start", display=display, returncode=xvfb.returncode)
             self._used_displays.discard(display)
+            self._used_ports.discard(vnc_port)
             raise RuntimeError(f"Xvfb failed to start on display :{display}")
 
         # Start x11vnc
@@ -139,6 +140,7 @@ class StreamingService:
             LOG.error("x11vnc failed to start", display=display, returncode=x11vnc.returncode)
             xvfb.terminate()
             self._used_displays.discard(display)
+            self._used_ports.discard(vnc_port)
             raise RuntimeError(f"x11vnc failed to start on display :{display}")
 
         # Start websockify
@@ -158,6 +160,7 @@ class StreamingService:
             x11vnc.terminate()
             xvfb.terminate()
             self._used_displays.discard(display)
+            self._used_ports.discard(vnc_port)
             raise RuntimeError(f"websockify failed to start on port {vnc_port}")
 
         self._session_vnc[session_id] = VncProcess(
