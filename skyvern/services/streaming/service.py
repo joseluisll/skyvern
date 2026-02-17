@@ -11,7 +11,7 @@ from skyvern.forge.sdk.api.files import get_skyvern_temp_dir
 from skyvern.forge.sdk.workflow.models.workflow import WorkflowRun, WorkflowRunStatus
 from skyvern.config import settings
 
-INTERVAL = 1
+INTERVAL = 10
 LOG = structlog.get_logger(__name__)
 
 
@@ -282,31 +282,35 @@ class StreamingService:
 
         os.environ["DISPLAY"] = BASE_DISPLAY_NUM
 
-        def is_running_exact(process_name: str) -> bool:
+        async def is_running_exact(process_name: str) -> bool:
             try:
-                proc = subprocess.Popen(
-                    ["pgrep", "-x", process_name],
+                proc = await asyncio.create_subprocess_exec(
+                    "pgrep",
+                    "-x",
+                    process_name,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                _, _ = proc.communicate()
+                await proc.wait()
                 return proc.returncode == 0
             except Exception:
                 return False
 
-        def is_running_match(pattern: str) -> bool:
+        async def is_running_match(pattern: str) -> bool:
             try:
-                proc = subprocess.Popen(
-                    ["pgrep", "-f", pattern],
+                proc = await asyncio.create_subprocess_exec(
+                    "pgrep",
+                    "-f",
+                    pattern,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                 )
-                stdout, _ = proc.communicate()
+                stdout, _ = await proc.communicate()
                 return proc.returncode == 0 and bool(stdout.strip())
             except Exception:
                 return False
 
-        def start_xvfb() -> None:
+        async def start_xvfb() -> None:
             LOG.info("Starting Xvfb...")
             # Clean up any existing lock file
             lock_file = f"/tmp/.X{BASE_DISPLAY_NUM[1:]}-lock"
@@ -317,13 +321,20 @@ class StreamingService:
                 except Exception as e:
                     LOG.warning("Failed to remove X server lock file", error=str(e))
 
-            cmd = ["Xvfb", BASE_DISPLAY_NUM, "-screen", "0", SCREEN_GEOMETRY]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = await asyncio.create_subprocess_exec(
+                "Xvfb",
+                BASE_DISPLAY_NUM,
+                "-screen",
+                "0",
+                SCREEN_GEOMETRY,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             LOG.info("Xvfb started successfully")
 
-        def start_x11vnc() -> None:
+        async def start_x11vnc() -> None:
             LOG.info("Starting x11vnc...")
-            cmd = [
+            proc = await asyncio.create_subprocess_exec(
                 "x11vnc",
                 "-display",
                 BASE_DISPLAY_NUM,
@@ -333,26 +344,34 @@ class StreamingService:
                 "localhost",
                 "-xkb",
                 "-forever",
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             LOG.info("x11vnc started successfully")
 
-        def start_websockify() -> None:
+        async def start_websockify() -> None:
             LOG.info("Starting websockify...")
-            cmd = [
+            proc = await asyncio.create_subprocess_exec(
                 "websockify",
                 "6080",
                 f"localhost:5900",
                 "--daemon",
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             LOG.info("websockify started successfully")
 
         # Check if VNC binaries are available
         vnc_available = True
         for binary in ["Xvfb", "x11vnc", "websockify"]:
             try:
-                subprocess.run([binary, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc = await asyncio.create_subprocess_exec(
+                    binary,
+                    "--help",
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                await proc.wait()
             except (subprocess.CalledProcessError, FileNotFoundError):
                 LOG.error(f"VNC binary not available: {binary}")
                 vnc_available = False
@@ -362,22 +381,22 @@ class StreamingService:
             return
 
         # Start Xvfb if not running
-        if not is_running_exact("Xvfb"):
-            start_xvfb()
+        if not await is_running_exact("Xvfb"):
+            await start_xvfb()
             LOG.info("Xvfb process restarted")
         else:
             LOG.debug("Xvfb already running")
 
         # Start x11vnc if not running
-        if not is_running_exact("x11vnc"):
-            start_x11vnc()
+        if not await is_running_exact("x11vnc"):
+            await start_x11vnc()
             LOG.info("x11vnc process restarted")
         else:
             LOG.debug("x11vnc already running")
 
         # Start websockify if not running
-        if not is_running_match("websockify.*6080"):
-            start_websockify()
+        if not await is_running_match("websockify.*6080"):
+            await start_websockify()
             LOG.info("websockify process restarted")
         else:
             LOG.debug("websockify already running")
@@ -399,7 +418,8 @@ class StreamingService:
             return self._monitoring_task
 
         # Ensure base VNC services are running before starting monitoring
-        self._ensure_base_vnc_running()
+        # Fire and forget to avoid blocking startup
+        asyncio.create_task(self._ensure_base_vnc_running())
 
         self._stop_event.clear()
         self._monitoring_task = asyncio.create_task(self._monitor_loop())
