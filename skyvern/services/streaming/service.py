@@ -49,33 +49,59 @@ class StreamingService:
         self._session_vnc: dict[str, VncProcess] = {}
         self._used_displays: set[int] = set()
         self._used_ports: set[int] = set()
+
+        # Base VNC process tracking
+        self._base_xvfb_process: Optional[subprocess.Popen] = None
+        self._base_x11vnc_process: Optional[subprocess.Popen] = None
+        self._base_websockify_process: Optional[subprocess.Popen] = None
         self._lock: asyncio.Lock = asyncio.Lock()
 
     def _allocate_display(self) -> int:
-        """
-        Allocate a free display number.
-
-        WARNING: This method must only be called while holding self._lock.
-        It modifies shared state (self._used_displays) without internal synchronization.
-        """
+        """Allocate a free display number."""
         display = BASE_DISPLAY
+        max_attempts = 1000  # Prevent infinite loops
+        attempts = 0
         while display in self._used_displays:
             display += 1
+            attempts += 1
+            if attempts >= max_attempts:
+                raise RuntimeError(f"No available displays (tried up to :{display})")
         self._used_displays.add(display)
         return display
 
     def _allocate_port(self) -> int:
-        """
-        Allocate a free VNC port.
-
-        WARNING: This method must only be called while holding self._lock.
-        It modifies shared state (self._used_ports) without internal synchronization.
-        """
+        """Allocate a free VNC port."""
         port = BASE_VNC_PORT
+        max_attempts = 1000  # Prevent infinite loops
+        attempts = 0
         while port in self._used_ports:
             port += 1
+            attempts += 1
+            if attempts >= max_attempts:
+                raise RuntimeError(f"No available ports (tried up to {port})")
         self._used_ports.add(port)
         return port
+
+    def _cleanup_vnc_resources(
+        self,
+        display: int,
+        vnc_port: int,
+        xvfb_process: subprocess.Popen | None = None,
+        x11vnc_process: subprocess.Popen | None = None,
+        websockify_process: subprocess.Popen | None = None,
+    ) -> None:
+        """Clean up VNC resources and terminate processes."""
+        # Terminate processes in reverse order
+        for proc in [websockify_process, x11vnc_process, xvfb_process]:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+        # Release resources
+        self._used_displays.discard(display)
+        self._used_ports.discard(vnc_port)
 
     async def start_vnc_for_session(
         self,
@@ -91,10 +117,10 @@ class StreamingService:
         Returns:
             tuple[int, int]: (display_number, vnc_port)
         """
+        display = self._allocate_display()
+        vnc_port = self._allocate_port()
         async with self._lock:
-            display = self._allocate_display()
-            vnc_port = self._allocate_port()
-        rfb_port = 5900 + (display - BASE_DISPLAY)
+            rfb_port = 5900 + (display - BASE_DISPLAY)
 
         LOG.info(
             "Starting VNC for session",
@@ -119,8 +145,7 @@ class StreamingService:
         await asyncio.sleep(0.5)
         if xvfb.poll() is not None:
             LOG.error("Xvfb failed to start", display=display, returncode=xvfb.returncode)
-            self._used_displays.discard(display)
-            self._used_ports.discard(vnc_port)
+            self._cleanup_vnc_resources(display, vnc_port, xvfb, None, None)
             raise RuntimeError(f"Xvfb failed to start on display :{display}")
 
         # Start x11vnc
@@ -148,9 +173,7 @@ class StreamingService:
         await asyncio.sleep(0.3)
         if x11vnc.poll() is not None:
             LOG.error("x11vnc failed to start", display=display, returncode=x11vnc.returncode)
-            xvfb.terminate()
-            self._used_displays.discard(display)
-            self._used_ports.discard(vnc_port)
+            self._cleanup_vnc_resources(display, vnc_port, xvfb, x11vnc, None)
             raise RuntimeError(f"x11vnc failed to start on display :{display}")
 
         # Start websockify
@@ -167,10 +190,7 @@ class StreamingService:
         await asyncio.sleep(0.2)
         if websockify.poll() is not None:
             LOG.error("websockify failed to start", vnc_port=vnc_port, returncode=websockify.returncode)
-            x11vnc.terminate()
-            xvfb.terminate()
-            self._used_displays.discard(display)
-            self._used_ports.discard(vnc_port)
+            self._cleanup_vnc_resources(display, vnc_port, xvfb, x11vnc, websockify)
             raise RuntimeError(f"websockify failed to start on port {vnc_port}")
 
         self._session_vnc[session_id] = VncProcess(
@@ -330,6 +350,7 @@ class StreamingService:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._base_xvfb_process = proc
             LOG.info("Xvfb started successfully")
 
         async def start_x11vnc() -> None:
@@ -347,6 +368,7 @@ class StreamingService:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._base_x11vnc_process = proc
             LOG.info("x11vnc started successfully")
 
         async def start_websockify() -> None:
@@ -359,6 +381,7 @@ class StreamingService:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            self._base_websockify_process = proc
             LOG.info("websockify started successfully")
 
         # Check if VNC binaries are available
@@ -418,8 +441,13 @@ class StreamingService:
             return self._monitoring_task
 
         # Ensure base VNC services are running before starting monitoring
-        # Fire and forget to avoid blocking startup
-        asyncio.create_task(self._ensure_base_vnc_running())
+        # Launch as a fire-and-forget task to avoid blocking startup
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._ensure_base_vnc_running())
+        except RuntimeError:
+            # No running event loop - this can happen during testing
+            LOG.warning("No running event loop, skipping base VNC setup")
 
         self._stop_event.clear()
         self._monitoring_task = asyncio.create_task(self._monitor_loop())
