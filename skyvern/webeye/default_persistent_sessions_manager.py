@@ -228,6 +228,10 @@ class DefaultPersistentSessionsManager(PersistentSessionsManager):
         LOG.info("Browser session begin", browser_session_id=browser_session_id)
 
     async def get_browser_address(self, session_id: str, organization_id: str) -> str:
+        # In local/OSS mode, return a default browser address since there's no cloud infrastructure
+        if settings.ENV == "local":
+            return "0.0.0.0:9223"
+
         address = await wait_on_persistent_browser_address(self.database, session_id, organization_id)
 
         if address is None:
