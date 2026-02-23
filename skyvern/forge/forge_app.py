@@ -268,7 +268,8 @@ def create_forge_app() -> ForgeApp:
     async def _startup_event(fastapi_app: FastAPI) -> None:
         if app.STREAMING_SERVICE is not None:
             structlog.get_logger(__name__).info("Starting streaming service monitoring loop")
-            await app.STREAMING_SERVICE.start_monitoring()
+            # Start monitoring as a fire-and-forget task - don't await it
+            app.STREAMING_SERVICE.start_monitoring()
 
     async def _shutdown_event() -> None:
         if app.STREAMING_SERVICE is not None:
