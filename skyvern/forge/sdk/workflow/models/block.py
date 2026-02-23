@@ -46,9 +46,9 @@ from skyvern.exceptions import (
     MissingBrowserState,
     MissingBrowserStatePage,
     PDFParsingError,
-    SkyvernException,
     TaskNotFound,
     UnexpectedTaskStatus,
+    get_user_facing_exception_message,
 )
 from skyvern.forge import app
 from skyvern.forge.prompts import prompt_engine
@@ -76,6 +76,7 @@ from skyvern.forge.sdk.schemas.task_v2 import TaskV2Status
 from skyvern.forge.sdk.schemas.tasks import Task, TaskOutput, TaskStatus
 from skyvern.forge.sdk.services.bitwarden import BitwardenConstants
 from skyvern.forge.sdk.services.credentials import AzureVaultConstants, OnePasswordConstants
+from skyvern.forge.sdk.settings_manager import SettingsManager
 from skyvern.forge.sdk.trace import traced
 from skyvern.forge.sdk.utils.pdf_parser import extract_pdf_file, validate_pdf_file
 from skyvern.forge.sdk.utils.sanitization import sanitize_postgres_text
@@ -182,7 +183,7 @@ class Block(BaseModel, abc.ABC):
         if self.model:
             model_name = self.model.get("model_name")
             if model_name:
-                mapping = settings.get_model_name_to_llm_key()
+                mapping = SettingsManager.get_settings().get_model_name_to_llm_key()
                 return mapping.get(model_name, {}).get("llm_key")
 
         return None
@@ -558,9 +559,7 @@ class Block(BaseModel, abc.ABC):
             if not workflow_run_context.has_value(self.output_parameter.key):
                 await self.record_output_parameter_value(workflow_run_context, workflow_run_id)
 
-            failure_reason = f"Unexpected error: {str(e)}"
-            if isinstance(e, SkyvernException):
-                failure_reason = f"unexpected SkyvernException({e.__class__.__name__}): {str(e)}"
+            failure_reason = get_user_facing_exception_message(e)
 
             return await self.build_block_result(
                 success=False,
@@ -815,6 +814,23 @@ class BaseTaskBlock(Block):
                         raise MissingBrowserStatePage(workflow_run_id=workflow_run.workflow_run_id)
                     if working_page.url == "about:blank" and self.url:
                         await browser_state.navigate_to_url(page=working_page, url=self.url)
+
+                    # When a browser profile is loaded, wait for the page to fully settle
+                    # so that cookie-based authentication can redirect or restore the session
+                    # BEFORE the agent starts interacting with the page.
+                    if workflow_run.browser_profile_id:
+                        LOG.info(
+                            "Browser profile loaded — waiting for page to settle before agent acts",
+                            browser_profile_id=workflow_run.browser_profile_id,
+                            workflow_run_id=workflow_run.workflow_run_id,
+                        )
+                        try:
+                            await working_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            LOG.debug(
+                                "networkidle timeout after browser profile load (non-fatal)",
+                                workflow_run_id=workflow_run.workflow_run_id,
+                            )
 
                 except Exception as e:
                     LOG.exception(
@@ -5309,22 +5325,23 @@ def _parse_single_evaluation(
     Parse a single evaluation from the LLM response.
 
     Handles two formats:
-    - New format (dict): {result: bool, rendered_condition: str, reasoning: str}
+    - Dict format: {result: bool, reasoning: str}
     - Legacy format: just a boolean value
+
+    The rendered expression always comes from the Jinja pre-rendering step (fallback),
+    not from the LLM response, to avoid the LLM re-interpreting already-resolved values.
 
     Args:
         evaluation: Single evaluation object from LLM (dict or bool)
         idx: Index of this evaluation (for fallback lookup)
-        fallback_rendered_expressions: Pre-rendered expressions to use if LLM didn't provide one
+        fallback_rendered_expressions: Pre-rendered expressions from Jinja rendering
 
     Returns:
-        Tuple of (boolean_result, rendered_condition_string)
+        Tuple of (boolean_result, rendered_expression_string)
     """
-    # Determine fallback rendered expression
-    fallback_rendered = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
+    rendered_expression = fallback_rendered_expressions[idx] if idx < len(fallback_rendered_expressions) else ""
 
     if isinstance(evaluation, dict):
-        # New format: {result, rendered_condition, reasoning}
         result = evaluation.get("result")
         if isinstance(result, bool):
             bool_result = result
@@ -5337,13 +5354,6 @@ def _parse_single_evaluation(
                 evaluated_result=bool_result,
             )
 
-        # Get rendered_condition, fallback to pre-rendered expression
-        rendered_cond = evaluation.get("rendered_condition")
-        if rendered_cond and isinstance(rendered_cond, str):
-            rendered_expression = rendered_cond
-        else:
-            rendered_expression = fallback_rendered
-
         return (bool_result, rendered_expression)
     else:
         # Legacy format: just a boolean
@@ -5352,7 +5362,7 @@ def _parse_single_evaluation(
         else:
             bool_result = _evaluate_truthy_string(str(evaluation))
 
-        return (bool_result, fallback_rendered)
+        return (bool_result, rendered_expression)
 
 
 class BranchCondition(BaseModel):
@@ -5433,15 +5443,14 @@ class ConditionalBlock(Block):
         browser_session_id: str | None = None,
     ) -> tuple[list[bool], list[str], str | None, dict | None]:
         """
-        Evaluate natural language branch conditions using a single ExtractionBlock.
+        Evaluate natural language branch conditions in batch.
 
         All prompt-based conditions are batched into ONE LLM call for performance.
         Jinja parts ({{ }}) are pre-rendered before sending to LLM.
 
-        ExtractionBlock provides:
-        - Browser/page access for expressions like "comment count > 100"
-        - UI visibility (shows up in workflow timeline with prompt/response)
-        - Proper LLM integration with data_schema
+        Evaluation strategy:
+        - If any condition is pure natural language, use ExtractionBlock for browser/page context.
+        - If all conditions contain Jinja and are pre-rendered, use direct LLM call (no browser context).
 
         Returns:
             A tuple of (results, rendered_expressions, extraction_goal, llm_response):
@@ -5483,6 +5492,9 @@ class ConditionalBlock(Block):
                         exc_info=True,
                     )
                     rendered_expression = expression
+                    # Rendering failed, so this expression is effectively unresolved and must
+                    # take the ExtractionBlock path (with context) instead of direct LLM mode.
+                    has_any_pure_natlang = True
             else:
                 rendered_expression = expression
                 has_any_pure_natlang = True
@@ -5514,7 +5526,7 @@ class ConditionalBlock(Block):
         )
 
         # Step 3: Build schema for array of evaluation results
-        # Order matters: rendered_condition -> reasoning -> result (chain-of-thought)
+        # Order matters: reasoning -> result (chain-of-thought)
         data_schema = {
             "type": "object",
             "properties": {
@@ -5523,22 +5535,16 @@ class ConditionalBlock(Block):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "rendered_condition": {
-                                "type": "string",
-                                "description": (
-                                    "The condition with all variable names and references replaced with actual values."
-                                ),
-                            },
                             "reasoning": {
                                 "type": "string",
-                                "description": "Explanation of the reasoning behind evaluating the rendered condition.",
+                                "description": "Explanation of the reasoning behind evaluating the condition.",
                             },
                             "result": {
                                 "type": "boolean",
-                                "description": "TRUE if the rendered condition is satisfied, FALSE otherwise.",
+                                "description": "TRUE if the condition is satisfied, FALSE otherwise.",
                             },
                         },
-                        "required": ["rendered_condition", "reasoning", "result"],
+                        "required": ["reasoning", "result"],
                     },
                     "description": "Array of evaluation results for each condition in the same order.",
                     "minItems": len(branches),
@@ -5548,69 +5554,88 @@ class ConditionalBlock(Block):
             "required": ["evaluations"],
         }
 
-        # Step 4: Create and execute single ExtractionBlock
-        output_param = OutputParameter(
-            output_parameter_id=str(uuid.uuid4()),
-            key=f"conditional_branch_eval_{generate_random_string()}",
-            workflow_id=self.output_parameter.workflow_id,
-            created_at=datetime.now(),
-            modified_at=datetime.now(),
-            parameter_type=ParameterType.OUTPUT,
-            description=f"Conditional branch evaluation results ({len(branches)} conditions)",
-        )
-
-        extraction_block = ExtractionBlock(
-            label=f"conditional_branch_eval_{generate_random_string()}",
-            data_extraction_goal=extraction_goal,
-            data_schema=data_schema,
-            output_parameter=output_param,
-        )
-
-        LOG.info(
-            "Conditional branch ExtractionBlock created (batched)",
-            block_label=self.label,
-            num_conditions=len(branches),
-            extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
-            has_browser_session=browser_session_id is not None,
-            has_context=context_json is not None,
-        )
-
         try:
-            extraction_result = await extraction_block.execute(
-                workflow_run_id=workflow_run_id,
-                workflow_run_block_id=workflow_run_block_id,
-                organization_id=organization_id,
-                browser_session_id=browser_session_id,
-            )
-
-            if not extraction_result.success:
-                LOG.error(
-                    "Conditional branch ExtractionBlock failed",
-                    block_label=self.label,
-                    failure_reason=extraction_result.failure_reason,
+            # Step 4: Evaluate conditions.
+            if has_any_pure_natlang:
+                output_param = OutputParameter(
+                    output_parameter_id=str(uuid.uuid4()),
+                    key=f"conditional_branch_eval_{generate_random_string()}",
+                    workflow_id=self.output_parameter.workflow_id,
+                    created_at=datetime.now(),
+                    modified_at=datetime.now(),
+                    parameter_type=ParameterType.OUTPUT,
+                    description=f"Conditional branch evaluation results ({len(branches)} conditions)",
                 )
-                raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
+                extraction_block = ExtractionBlock(
+                    label=f"conditional_branch_eval_{generate_random_string()}",
+                    data_extraction_goal=extraction_goal,
+                    data_schema=data_schema,
+                    output_parameter=output_param,
+                )
+                LOG.info(
+                    "Conditional branch ExtractionBlock created (batched)",
+                    block_label=self.label,
+                    num_conditions=len(branches),
+                    extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+                    has_browser_session=browser_session_id is not None,
+                    has_any_pure_natlang=has_any_pure_natlang,
+                    using_browser_session=browser_session_id is not None,
+                    has_context=context_json is not None,
+                )
+                extraction_result = await extraction_block.execute(
+                    workflow_run_id=workflow_run_id,
+                    workflow_run_block_id=workflow_run_block_id,
+                    organization_id=organization_id,
+                    browser_session_id=browser_session_id,
+                )
 
-            # Record output parameter value if workflow context available
-            if workflow_run_context:
-                try:
-                    await extraction_block.record_output_parameter_value(
-                        workflow_run_context=workflow_run_context,
-                        workflow_run_id=workflow_run_id,
-                        value=extraction_result.output_parameter_value,
-                    )
-                except Exception:
-                    LOG.warning(
-                        "Failed to record conditional branch evaluation output",
-                        workflow_run_id=workflow_run_id,
+                if not extraction_result.success:
+                    LOG.error(
+                        "Conditional branch ExtractionBlock failed",
                         block_label=self.label,
-                        exc_info=True,
+                        failure_reason=extraction_result.failure_reason,
                     )
+                    raise ValueError(f"Branch evaluation failed: {extraction_result.failure_reason}")
 
-            # Step 5: Extract the evaluation results (result + rendered_condition)
-            output_value = extraction_result.output_parameter_value
+                if workflow_run_context:
+                    try:
+                        await extraction_block.record_output_parameter_value(
+                            workflow_run_context=workflow_run_context,
+                            workflow_run_id=workflow_run_id,
+                            value=extraction_result.output_parameter_value,
+                        )
+                    except Exception:
+                        LOG.warning(
+                            "Failed to record conditional branch evaluation output",
+                            workflow_run_id=workflow_run_id,
+                            block_label=self.label,
+                            exc_info=True,
+                        )
+
+                output_value = extraction_result.output_parameter_value
+            else:
+                # Do not use ExtractionBlock when every expression has already been Jinja-rendered.
+                # ExtractionBlock may still have page/browser context, which can cause the LLM to
+                # reinterpret resolved literals as on-screen references.
+                LOG.info(
+                    "Conditional branch using direct LLM evaluation (no browser context)",
+                    block_label=self.label,
+                    num_conditions=len(branches),
+                    extraction_goal_preview=extraction_goal[:500] if extraction_goal else None,
+                    has_context=False,
+                )
+                output_value = await app.LLM_API_HANDLER(
+                    prompt=extraction_goal,
+                    prompt_name="conditional-prompt-branch-evaluation",
+                    force_dict=True,
+                )
+
+            # Step 5: Extract the evaluation results (reasoning + result)
             results_array: list[bool] = []
             llm_rendered_expressions: list[str] = []
+
+            if isinstance(output_value, list):
+                output_value = {"evaluations": output_value}
 
             if not isinstance(output_value, dict):
                 raise ValueError(f"Unexpected output format: {type(output_value)}")
@@ -5618,7 +5643,7 @@ class ConditionalBlock(Block):
             # Find evaluations array from LLM output (handles ExtractionBlock nesting)
             raw_evaluations = _find_evaluations_array(output_value)
 
-            # Parse each evaluation to extract result and rendered_condition
+            # Parse each evaluation to extract result (rendered expression comes from Jinja pre-rendering)
             for idx, evaluation in enumerate(raw_evaluations):
                 bool_result, rendered_expr = _parse_single_evaluation(
                     evaluation=evaluation,
@@ -5645,7 +5670,7 @@ class ConditionalBlock(Block):
 
         except Exception as exc:
             LOG.error(
-                "Conditional branch ExtractionBlock execution failed",
+                "Conditional branch prompt evaluation failed",
                 block_label=self.label,
                 error=str(exc),
                 exc_info=True,
