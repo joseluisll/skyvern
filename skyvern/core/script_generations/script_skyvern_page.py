@@ -27,7 +27,7 @@ from skyvern.forge.sdk.api.files import (
 from skyvern.forge.sdk.artifact.models import ArtifactType
 from skyvern.forge.sdk.core import skyvern_context
 from skyvern.schemas.steps import AgentStepOutput
-from skyvern.services.otp_service import poll_otp_value
+from skyvern.services.otp_service import poll_otp_value, try_generate_totp_from_credential
 from skyvern.utils.url_validators import prepend_scheme_and_validate_url
 from skyvern.webeye.actions.action_types import ActionType
 from skyvern.webeye.actions.actions import (
@@ -240,6 +240,7 @@ class ScriptSkyvernPage(SkyvernPage):
             # Wait for page to be ready before executing action
             # This helps prevent issues where cached actions execute before the page is fully loaded
             await self._wait_for_page_ready_before_action()
+            await self._ensure_element_ids_on_page()
 
             call.result = await fn(self, *args, **kwargs)
 
@@ -561,6 +562,39 @@ class ScriptSkyvernPage(SkyvernPage):
             # Don't block action execution if page readiness check fails
             LOG.debug("Page readiness check failed, proceeding with action", exc_info=True)
 
+    async def _ensure_element_ids_on_page(self) -> None:
+        """
+        Ensure unique_id attributes exist on DOM elements for cached selectors.
+
+        After page navigation, the new DOM has no unique_id attributes because
+        they are only set during scraping (domUtils.js buildTreeFromBody). Cached
+        actions use [unique_id='XXX'] selectors, so we need to build the element
+        tree before executing cached actions on a new page.
+        """
+        try:
+            if not self.page:
+                return
+
+            # Quick check: do unique_id attributes already exist?
+            has_unique_ids = await self.page.evaluate("() => document.querySelector('[unique_id]') !== null")
+            if has_unique_ids:
+                return
+
+            # Inject domUtils.js and build the element tree to set unique_id attrs.
+            # Use a short timeout since this is best-effort; we don't want to hang for 60s.
+            skyvern_frame = await SkyvernFrame.create_instance(frame=self.page)
+            await skyvern_frame.build_tree_from_body(
+                frame_name="main.frame",
+                frame_index=0,
+                timeout_ms=15000,
+            )
+            LOG.info("Injected element IDs on page for cached script execution")
+        except Exception:
+            LOG.debug(
+                "Failed to ensure element IDs on page, proceeding with action",
+                exc_info=True,
+            )
+
     async def get_actual_value(
         self,
         value: str,
@@ -581,16 +615,21 @@ class ScriptSkyvernPage(SkyvernPage):
             if is_totp_value:
                 value = generate_totp_value(context.workflow_run_id, original_value)
             elif (totp_identifier or totp_url) and organization_id:
-                totp_value = await poll_otp_value(
-                    organization_id=organization_id,
-                    task_id=task_id,
-                    workflow_run_id=workflow_run_id,
-                    totp_verification_url=totp_url,
-                    totp_identifier=totp_identifier,
-                )
-                if totp_value:
-                    # use the totp verification code
-                    value = totp_value.value
+                # Try credential TOTP first (higher priority than webhook/totp_identifier)
+                credential_totp = try_generate_totp_from_credential(workflow_run_id)
+                if credential_totp:
+                    value = credential_totp.value
+                else:
+                    totp_value = await poll_otp_value(
+                        organization_id=organization_id,
+                        task_id=task_id,
+                        workflow_run_id=workflow_run_id,
+                        totp_verification_url=totp_url,
+                        totp_identifier=totp_identifier,
+                    )
+                    if totp_value:
+                        # use the totp verification code
+                        value = totp_value.value
 
         return value
 
